@@ -1,0 +1,579 @@
+openapi: 3.0.3
+info:
+  title: Claims API
+  version: 1.0.0
+  description: >-
+    Claims service for the Digital Insurance platform. Files, triages, and
+    settles insurance claims. It verifies cover and reads coverage limits
+    through the internal Policy API, books settlement payouts through the
+    internal Payment API, stores claims in MongoDB, stores claim documents in
+    AWS S3, and uses Redis for the triage lock and result cache. Triage is run
+    by an OpenAI gpt-4o-mini agent grounded in policy wording retrieved from a
+    Pinecone index, and uploaded documents are read by an Anthropic
+    claude-sonnet-4-5 extraction agent. The same claim tools are exposed to
+    other agents over MCP.
+servers:
+  - url: https://claims.digitalinsurance.dev
+    description: Production
+tags:
+  - name: claims
+    description: Claim intake, documents, triage, and settlement
+  - name: health
+    description: Liveness of the service and its stateful dependencies
+paths:
+  /v1/claims:
+    post:
+      tags:
+        - claims
+      operationId: fileClaim
+      summary: File a claim
+      description: >-
+        Verifies the policy through the Policy API
+        (`GET /v1/policies/{policyNumber}`) before the claim is stored. A claim
+        cannot be filed against a cancelled or declined policy, or for a loss
+        dated before the policy inception date.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileClaimRequest'
+      responses:
+        '201':
+          description: Claim filed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Claim'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    get:
+      tags:
+        - claims
+      operationId: listClaims
+      summary: List claims, optionally for one policy
+      description: >-
+        Medical notes are projected out of list responses.
+      parameters:
+        - name: policyNumber
+          in: query
+          required: false
+          description: Narrow the list to claims filed against one policy
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching claims, newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimList'
+  /v1/claims/{claimId}:
+    get:
+      tags:
+        - claims
+      operationId: getClaim
+      summary: Fetch a claim by id
+      parameters:
+        - $ref: '#/components/parameters/ClaimId'
+      responses:
+        '200':
+          description: The claim
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Claim'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/claims/{claimId}/documents:
+    post:
+      tags:
+        - claims
+      operationId: uploadClaimDocument
+      summary: Upload a claim document
+      description: >-
+        Stores the document bytes in AWS S3 under
+        `claims/{claimId}/{documentId}/{filename}` and runs the Anthropic
+        claude-sonnet-4-5 extraction agent over the supplied text layer. Only
+        the object key and the extracted fields are written to MongoDB.
+      parameters:
+        - $ref: '#/components/parameters/ClaimId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadDocumentRequest'
+      responses:
+        '201':
+          description: The stored document and its extracted fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimDocument'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/claims/{claimId}/triage:
+    post:
+      tags:
+        - claims
+      operationId: triageClaim
+      summary: Run the claim triage agent
+      description: >-
+        Retrieves the relevant policy wording clauses from Pinecone, reads the
+        policy and its coverage limit from the Policy API, and runs the OpenAI
+        gpt-4o-mini triage agent against a zod-constrained result shape. A Redis
+        lock prevents concurrent runs and the result is cached in Redis for 15
+        minutes; pass `force` to re-run regardless.
+      parameters:
+        - $ref: '#/components/parameters/ClaimId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriageRequest'
+      responses:
+        '200':
+          description: The triage recommendation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriageResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/claims/{claimId}/settle:
+    post:
+      tags:
+        - claims
+      operationId: settleClaim
+      summary: Settle a claim and pay the claimant
+      description: >-
+        Caps the payout at the policy's coverage limit read from the Policy API,
+        books the disbursement through the Payment API
+        (`POST /v1/payments/charge`), and reads the payment back
+        (`GET /v1/payments/{paymentId}`) so a payout parked on 3DS is not
+        recorded as paid. The claim must be triaged first, and a claim the
+        triage agent routed to a human adjuster needs `approvedBy`.
+      parameters:
+        - $ref: '#/components/parameters/ClaimId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettleRequest'
+      responses:
+        '200':
+          description: The recorded settlement
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settlement'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /health:
+    get:
+      tags:
+        - health
+      operationId: getHealth
+      summary: Service and dependency liveness
+      responses:
+        '200':
+          description: Health report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+components:
+  parameters:
+    ClaimId:
+      name: claimId
+      in: path
+      required: true
+      description: Claim identifier
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Conflicting state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    FileClaimRequest:
+      type: object
+      required:
+        - policyNumber
+        - claimantName
+        - claimantEmail
+        - dateOfLoss
+        - lossType
+        - incidentNarrative
+        - claimedAmountCents
+      properties:
+        policyNumber:
+          type: string
+          description: The Policy API policy id the claim is filed against
+        claimantName:
+          type: string
+          maxLength: 120
+        claimantEmail:
+          type: string
+          format: email
+        dateOfBirth:
+          type: string
+          format: date
+        dateOfLoss:
+          type: string
+          format: date
+        lossType:
+          $ref: '#/components/schemas/LossType'
+        incidentNarrative:
+          type: string
+          minLength: 20
+          maxLength: 4000
+          description: The loss described by the policyholder in their own words
+        medicalNotes:
+          type: string
+          maxLength: 4000
+          description: >-
+            Health data supplied on bodily-injury claims. Read by the triage
+            agent and omitted from list responses.
+        claimedAmountCents:
+          type: integer
+          format: int64
+          minimum: 1
+        currency:
+          type: string
+          example: usd
+    LossType:
+      type: string
+      enum:
+        - collision
+        - theft
+        - fire
+        - water_damage
+        - bodily_injury
+        - third_party_liability
+    ClaimStatus:
+      type: string
+      enum:
+        - filed
+        - triaged
+        - awaiting_adjuster
+        - approved
+        - declined
+        - settled
+    Claim:
+      type: object
+      properties:
+        claimId:
+          type: string
+        policyNumber:
+          type: string
+        customerId:
+          type: string
+        productType:
+          type: string
+        claimantName:
+          type: string
+        claimantEmail:
+          type: string
+          format: email
+        dateOfBirth:
+          type: string
+          format: date
+          nullable: true
+        dateOfLoss:
+          type: string
+          format: date
+        lossType:
+          $ref: '#/components/schemas/LossType'
+        incidentNarrative:
+          type: string
+        medicalNotes:
+          type: string
+          nullable: true
+        claimedAmountCents:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        status:
+          $ref: '#/components/schemas/ClaimStatus'
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClaimDocument'
+        triage:
+          allOf:
+            - $ref: '#/components/schemas/TriageResult'
+          nullable: true
+        settlement:
+          allOf:
+            - $ref: '#/components/schemas/Settlement'
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+    ClaimList:
+      type: array
+      items:
+        $ref: '#/components/schemas/Claim'
+    UploadDocumentRequest:
+      type: object
+      required:
+        - filename
+        - contentType
+        - content
+        - text
+      properties:
+        filename:
+          type: string
+          maxLength: 255
+        contentType:
+          type: string
+          enum:
+            - application/pdf
+            - image/jpeg
+            - image/png
+            - text/plain
+        content:
+          type: string
+          format: byte
+          description: The document bytes, base64 encoded
+        text:
+          type: string
+          maxLength: 60000
+          description: The document's text layer, read by the extraction agent
+    ClaimDocument:
+      type: object
+      properties:
+        documentId:
+          type: string
+        filename:
+          type: string
+        contentType:
+          type: string
+        s3Key:
+          type: string
+          description: S3 object key; the bytes are never stored in MongoDB
+        sizeBytes:
+          type: integer
+        uploadedAt:
+          type: string
+          format: date-time
+        extraction:
+          allOf:
+            - $ref: '#/components/schemas/DocumentExtraction'
+          nullable: true
+    DocumentExtraction:
+      type: object
+      description: Fields extracted by the claude-sonnet-4-5 extraction agent
+      properties:
+        documentType:
+          type: string
+          enum:
+            - invoice
+            - estimate
+            - police_report
+            - medical_report
+            - receipt
+            - unknown
+        issuer:
+          type: string
+          nullable: true
+        documentDate:
+          type: string
+          format: date
+          nullable: true
+        referenceNumber:
+          type: string
+          nullable: true
+        totalAmountCents:
+          type: integer
+          format: int64
+          nullable: true
+        currency:
+          type: string
+          nullable: true
+        lineItems:
+          type: array
+          items:
+            type: object
+            properties:
+              description:
+                type: string
+              amountCents:
+                type: integer
+                format: int64
+                nullable: true
+        summary:
+          type: string
+          nullable: true
+        containsMedicalData:
+          type: boolean
+        model:
+          type: string
+          example: claude-sonnet-4-5
+    TriageRequest:
+      type: object
+      properties:
+        force:
+          type: boolean
+          description: Re-run the agent even when a cached result is still warm
+        fastTrackThresholdCents:
+          type: integer
+          format: int64
+          description: Claims at or below this amount may be fast tracked
+    TriageResult:
+      type: object
+      description: Recommendation produced by the gpt-4o-mini triage agent
+      properties:
+        recommendation:
+          type: string
+          enum:
+            - fast_track
+            - standard_review
+            - adjuster_review
+            - decline
+        severity:
+          type: string
+          enum:
+            - minor
+            - moderate
+            - major
+            - catastrophic
+        coveredUnderPolicy:
+          type: boolean
+        citedClauseId:
+          type: string
+          nullable: true
+          description: Id of the Pinecone clause the recommendation rests on
+        quotedClause:
+          type: string
+          nullable: true
+        recommendedPayoutCents:
+          type: integer
+          format: int64
+        fraudIndicators:
+          type: array
+          items:
+            type: string
+        requiresHumanAdjuster:
+          type: boolean
+        missingInformation:
+          type: array
+          items:
+            type: string
+        rationale:
+          type: string
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        model:
+          type: string
+          example: gpt-4o-mini
+        retrievedClauseIds:
+          type: array
+          items:
+            type: string
+        triagedAt:
+          type: string
+          format: date-time
+    SettleRequest:
+      type: object
+      required:
+        - paymentMethodId
+      properties:
+        amountCents:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            Defaults to the triage recommendation; capped at the coverage limit
+        paymentMethodId:
+          type: string
+          description: The claimant's payout destination, held by the Payment API
+        approvedBy:
+          type: string
+          description: Required when triage routed the claim to a human adjuster
+    Settlement:
+      type: object
+      properties:
+        paymentId:
+          type: string
+        amountCents:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        status:
+          type: string
+          enum:
+            - succeeded
+            - requires_action
+            - refunded
+        settledAt:
+          type: string
+          format: date-time
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - degraded
+        service:
+          type: string
+          example: claims-api
+        dependencies:
+          type: object
+          properties:
+            mongodb:
+              type: string
+              enum:
+                - up
+                - down
+            redis:
+              type: string
+              enum:
+                - up
+                - down
+        checkedAt:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        error:
+          type: string
