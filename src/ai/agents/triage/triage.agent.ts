@@ -1,4 +1,4 @@
-import { generateObject } from 'ai';
+import { generateObject, wrapLanguageModel, type LanguageModelV2Middleware } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
@@ -12,9 +12,10 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. A Language Model Middleware intercepts the call to retrieve the
+ * relevant policy wording clauses from Pinecone and inject them into the
+ * prompt, so the agent quotes real wording instead of paraphrasing from
+ * memory. The retrieval logic is fully decoupled from the agent's call-site.
  */
 
 export const triageResultSchema = z.object({
@@ -74,26 +75,86 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Language Model Middleware that performs RAG for the triage agent.
+ *
+ * The middleware extracts the narrative and productType that were embedded in
+ * the prompt by `buildTriagePrompt`, searches Pinecone for matching policy
+ * wording clauses, then rewrites the last user message so the model receives
+ * the retrieved wording — all without touching the agent's call-site.
+ *
+ * The retrieved clause ids are stored on a per-call context object so
+ * `runTriageAgent` can surface them in its return value.
+ */
+function createRagMiddleware(
+  onClauses: (clauseIds: string[]) => void,
+  input: TriageAgentInput,
+  fastTrackThresholdCents: number,
+): LanguageModelV2Middleware {
+  return {
+    middlewareVersion: 'v2',
+    async transformParams({ params }) {
+      const clauses = await searchPolicyWording(
+        input.incidentNarrative,
+        input.productType,
+      );
+
+      onClauses(clauses.map((c) => c.clauseId));
+
+      const promptInput: TriagePromptInput = {
+        ...input,
+        fastTrackThresholdCents,
+        clauses,
+      };
+
+      const enrichedPrompt = buildTriagePrompt(promptInput);
+
+      // Replace the last user message (the raw prompt) with the clause-enriched
+      // version. All other params (system, temperature, schema, …) are passed
+      // through unchanged.
+      const messages = params.prompt.map((message, index) => {
+        if (
+          index === params.prompt.length - 1 &&
+          message.role === 'user'
+        ) {
+          return {
+            ...message,
+            content: [{ type: 'text' as const, text: enrichedPrompt }],
+          };
+        }
+        return message;
+      });
+
+      return { ...params, prompt: messages };
+    },
+  };
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
-  );
+  const fastTrackThresholdCents =
+    input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS;
 
-  const promptInput: TriagePromptInput = {
-    ...input,
-    fastTrackThresholdCents:
-      input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
-  };
+  let retrievedClauseIds: string[] = [];
+
+  const ragModel = wrapLanguageModel({
+    model: openai(TRIAGE_MODEL),
+    middleware: createRagMiddleware(
+      (ids) => { retrievedClauseIds = ids; },
+      input,
+      fastTrackThresholdCents,
+    ),
+  });
 
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model: ragModel,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
+    // The raw narrative is passed as the initial prompt; the middleware replaces
+    // it with the fully rendered, clause-enriched prompt before the provider
+    // call is made.
+    prompt: input.incidentNarrative,
     temperature: 0.1,
     maxRetries: 2,
   });
@@ -109,6 +170,6 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
+    retrievedClauseIds,
   };
 }
