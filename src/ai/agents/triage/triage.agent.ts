@@ -1,6 +1,7 @@
-import { generateObject } from 'ai';
+import { generateObject, wrapLanguageModel } from 'ai';
+import type { LanguageModelV1Middleware } from 'ai';
 import { z } from 'zod';
-import { TRIAGE_MODEL, openai } from '../../openai.provider';
+import { TRIAGE_MODEL, gateway } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
@@ -12,9 +13,9 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. Relevant policy wording clauses are injected via Language Model
+ * Middleware so the agent quotes real wording instead of paraphrasing from
+ * memory — and the generateObject call stays clean and provider-agnostic.
  */
 
 export const triageResultSchema = z.object({
@@ -74,26 +75,69 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Language Model Middleware that performs RAG retrieval and injects the
+ * retrieved policy wording clauses into the prompt before the model is called.
+ * Centralising retrieval here keeps generateObject clean and makes the logic
+ * reusable across any model wrapped with this middleware.
+ */
+function buildPolicyRagMiddleware(
+  input: TriageAgentInput,
+  onClauses: (ids: string[]) => void,
+): LanguageModelV1Middleware {
+  return {
+    wrapGenerate: async ({ doGenerate, params }) => {
+      const clauses = await searchPolicyWording(
+        input.incidentNarrative,
+        input.productType,
+      );
+      onClauses(clauses.map((c) => c.clauseId));
+
+      const promptInput: TriagePromptInput = {
+        ...input,
+        fastTrackThresholdCents:
+          input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
+        clauses,
+      };
+
+      // Replace the prompt with the RAG-enriched version.
+      const enrichedParams = {
+        ...params,
+        prompt: [
+          {
+            role: 'user' as const,
+            content: [
+              {
+                type: 'text' as const,
+                text: buildTriagePrompt(promptInput),
+              },
+            ],
+          },
+        ],
+      };
+
+      return doGenerate(enrichedParams);
+    },
+  };
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
-  );
+  let retrievedClauseIds: string[] = [];
 
-  const promptInput: TriagePromptInput = {
-    ...input,
-    fastTrackThresholdCents:
-      input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
-  };
+  const modelWithRag = wrapLanguageModel({
+    model: gateway(TRIAGE_MODEL),
+    middleware: buildPolicyRagMiddleware(input, (ids) => {
+      retrievedClauseIds = ids;
+    }),
+  });
 
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model: modelWithRag,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
+    prompt: input.incidentNarrative,
     temperature: 0.1,
     maxRetries: 2,
   });
@@ -109,6 +153,6 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
+    retrievedClauseIds,
   };
 }

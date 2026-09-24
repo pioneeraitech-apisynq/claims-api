@@ -1,21 +1,22 @@
-import { createOpenAI } from '@ai-sdk/openai';
+import { createGateway } from '@ai-sdk/gateway';
 
 /**
- * Gateway-ready OpenAI provider.
+ * AI SDK Gateway provider.
  *
- * The base URL is read from OPENAI_BASE_URL and defaults to the public OpenAI
- * API. Point that one variable at the APISynQ AI gateway
- * (https://governance-api.apisynq.com/v1/ai-gw/openai/v1) and every OpenAI call
- * this service makes — chat completions for triage and embeddings for policy
- * wording retrieval — is routed through the gateway without a code change.
+ * All model calls — chat completions for triage and embeddings for policy
+ * wording retrieval — are addressed via the unified Gateway string format
+ * (e.g. `'openai/gpt-4o-mini'`).  Routing traffic through the APISynQ AI
+ * gateway requires no code change: set GATEWAY_BASE_URL to
+ * https://governance-api.apisynq.com/v1/ai-gw and the gateway provider
+ * handles the rest.
  */
-export const openai = createOpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+export const gateway = createGateway({
+  apiKey: process.env.GATEWAY_API_KEY,
+  baseURL: process.env.GATEWAY_BASE_URL,
 });
 
 /** Model used by the claim triage agent. */
-export const TRIAGE_MODEL = 'gpt-4o-mini';
+export const TRIAGE_MODEL = 'openai/gpt-4o-mini';
 
 /** Model used to embed claim narratives and policy wording clauses. */
-export const EMBEDDING_MODEL = 'text-embedding-3-small';
+export const EMBEDDING_MODEL = 'openai/text-embedding-3-small';
