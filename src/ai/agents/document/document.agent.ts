@@ -1,4 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { anthropic } from '@ai-sdk/anthropic';
+import { generateText } from 'ai';
 import { z } from 'zod';
 import {
   DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
@@ -11,18 +12,13 @@ import {
  * Runs Anthropic claude-sonnet-4-5 over the text of an uploaded claim document
  * and returns the fields the adjuster and the triage agent need: who issued it,
  * when, what it totals, and whether it carries medical data.
+ *
+ * Uses the AI SDK's Anthropic provider so this agent shares the same
+ * observability, retry, and middleware surfaces as every other agent in the
+ * service, instead of bypassing the SDK via the raw @anthropic-ai/sdk client.
  */
 
 export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-4-5';
-
-let anthropic: Anthropic | null = null;
-
-function getAnthropic(): Anthropic {
-  if (!anthropic) {
-    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  }
-  return anthropic;
-}
 
 export const documentExtractionSchema = z.object({
   documentType: z.enum([
@@ -65,21 +61,13 @@ export async function runDocumentExtractionAgent(
   contentType: string,
   text: string,
 ): Promise<DocumentExtractionOutput> {
-  const message = await getAnthropic().messages.create({
-    model: DOCUMENT_EXTRACTION_MODEL,
-    max_tokens: 2048,
-    temperature: 0,
+  const { text: raw } = await generateText({
+    model: anthropic(DOCUMENT_EXTRACTION_MODEL),
     system: DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: buildDocumentExtractionPrompt(filename, contentType, text),
-      },
-    ],
+    prompt: buildDocumentExtractionPrompt(filename, contentType, text),
+    maxTokens: 2048,
+    temperature: 0,
   });
-
-  const block = message.content.find((part) => part.type === 'text');
-  const raw = block && block.type === 'text' ? block.text : '';
 
   return {
     ...parseExtraction(raw),
