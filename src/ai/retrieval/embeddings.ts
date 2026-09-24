@@ -1,5 +1,5 @@
 import { embed, embedMany } from 'ai';
-import { EMBEDDING_MODEL, openai } from '../openai.provider';
+import { EMBEDDING_MODEL, gateway } from '../openai.provider';
 
 /**
  * Embeddings for policy wording retrieval, produced with OpenAI
@@ -8,7 +8,7 @@ import { EMBEDDING_MODEL, openai } from '../openai.provider';
  */
 export async function embedQuery(text: string): Promise<number[]> {
   const { embedding } = await embed({
-    model: openai.embedding(EMBEDDING_MODEL),
+    model: gateway.textEmbeddingModel(EMBEDDING_MODEL),
     value: text,
   });
   return embedding;
@@ -16,7 +16,7 @@ export async function embedQuery(text: string): Promise<number[]> {
 
 export async function embedClauses(texts: string[]): Promise<number[][]> {
   const { embeddings } = await embedMany({
-    model: openai.embedding(EMBEDDING_MODEL),
+    model: gateway.textEmbeddingModel(EMBEDDING_MODEL),
     values: texts,
   });
   return embeddings;
