@@ -152,6 +152,11 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * Finding #3: the updateOne and writeCachedTriage writes are wrapped in an
+   * ACID session.withTransaction() so that a crash between the two steps cannot
+   * leave the document in an inconsistent state (e.g. status updated but cache
+   * entry missing, or vice-versa if the order were reversed).
    */
   async triage(
     claimId: string,
@@ -194,21 +199,32 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      // Finding #3: wrap the MongoDB write and the Redis cache write in an
+      // ACID transaction so both succeed or both are rolled back atomically.
+      const session = await this.claimModel.db.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne(
+              { claimId },
+              {
+                $set: {
+                  triage: { ...result, triagedAt: new Date().toISOString() },
+                  status: result.requiresHumanAdjuster
+                    ? 'awaiting_adjuster'
+                    : 'triaged',
+                },
+              },
+              { session },
+            )
+            .exec();
 
-      await writeCachedTriage(claimId, result);
+          await writeCachedTriage(claimId, result);
+        });
+      } finally {
+        await session.endSession();
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
@@ -218,6 +234,11 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * Finding #3: the final updateOne that persists settlement/status is wrapped
+   * in an ACID session.withTransaction() so a crash or transient error after
+   * the Payment API call cannot leave a payment booked but the claim document
+   * un-updated (or vice-versa on retry).
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +286,30 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Finding #3: wrap the persistence step in an ACID transaction.  The
+    // external Payment API call (above) is intentionally kept outside the
+    // transaction because it is not idempotent inside a Mongo session; only the
+    // document write that records its result is transactional.
+    const session = await this.claimModel.db.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
