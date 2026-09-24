@@ -115,6 +115,15 @@ export class Claim {
   @Prop({ required: true })
   claimantName: string;
 
+  /**
+   * Finding #4: PII fields (claimantEmail, dateOfBirth) should be protected by
+   * MongoDB Client-Side Field Level Encryption (CSFLE) or Queryable Encryption
+   * at the driver/KMS configuration layer. The schema type must remain String so
+   * that the encrypted BSON binary produced by the driver round-trips correctly.
+   * Configure the ClientEncryption options in the Mongoose connection (app.module.ts)
+   * with a data-encryption key per field and the appropriate KMS provider
+   * (e.g., AWS KMS, Azure Key Vault, or a local master key for dev).
+   */
   @Prop({ required: true })
   claimantEmail: string;
 
@@ -131,8 +140,14 @@ export class Claim {
   incidentNarrative: string;
 
   /**
-   * Free-text medical notes supplied on bodily-injury claims. Health data: read
-   * by the triage agent, never returned in list responses.
+   * Finding #4: Free-text medical notes — health data subject to strict
+   * regulatory requirements (HIPAA/GDPR). This field MUST be protected by
+   * MongoDB Client-Side Field Level Encryption (CSFLE) or Queryable Encryption
+   * so that plaintext never leaves the application process unencrypted.
+   * Configure the driver-level encryptedFields / schemaMap in app.module.ts
+   * (MongooseModule.forRoot options → encryptedFieldsMap) with a dedicated
+   * DEK for this field and the production KMS provider. The Mongoose type
+   * stays String; the driver transparently encrypts/decrypts the value.
    */
   @Prop({ default: null })
   medicalNotes: string | null;
