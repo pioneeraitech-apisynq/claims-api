@@ -1,4 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { createAnthropic } from '@ai-sdk/anthropic';
+import { generateObject } from 'ai';
 import { z } from 'zod';
 import {
   DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
@@ -11,17 +12,31 @@ import {
  * Runs Anthropic claude-sonnet-4-5 over the text of an uploaded claim document
  * and returns the fields the adjuster and the triage agent need: who issued it,
  * when, what it totals, and whether it carries medical data.
+ *
+ * The model is accessed through the AI SDK `@ai-sdk/anthropic` provider so
+ * that all model traffic shares the same observable, gateway-routable path as
+ * the triage agent rather than reaching the Anthropic API directly.
  */
 
 export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-4-5';
 
-let anthropic: Anthropic | null = null;
+/**
+ * Lazy singleton for the Anthropic AI SDK provider.
+ * The base URL is read from ANTHROPIC_BASE_URL so the same gateway-routing
+ * pattern used for OpenAI traffic can be applied here too.
+ */
+let _anthropic: ReturnType<typeof createAnthropic> | null = null;
 
-function getAnthropic(): Anthropic {
-  if (!anthropic) {
-    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+function getAnthropicProvider(): ReturnType<typeof createAnthropic> {
+  if (!_anthropic) {
+    _anthropic = createAnthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      ...(process.env.ANTHROPIC_BASE_URL
+        ? { baseURL: process.env.ANTHROPIC_BASE_URL }
+        : {}),
+    });
   }
-  return anthropic;
+  return _anthropic;
 }
 
 export const documentExtractionSchema = z.object({
@@ -59,56 +74,28 @@ export interface DocumentExtractionOutput extends DocumentExtraction {
 /**
  * Extract fields from one claim document. The caller passes the document's text
  * layer; binary formats are converted upstream.
+ *
+ * Uses `generateObject` with the AI SDK Anthropic provider so schema validation
+ * and structured output are handled by the SDK rather than a manual JSON parse.
  */
 export async function runDocumentExtractionAgent(
   filename: string,
   contentType: string,
   text: string,
 ): Promise<DocumentExtractionOutput> {
-  const message = await getAnthropic().messages.create({
-    model: DOCUMENT_EXTRACTION_MODEL,
-    max_tokens: 2048,
-    temperature: 0,
+  const anthropic = getAnthropicProvider();
+
+  const { object } = await generateObject({
+    model: anthropic(DOCUMENT_EXTRACTION_MODEL),
+    schema: documentExtractionSchema,
     system: DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: buildDocumentExtractionPrompt(filename, contentType, text),
-      },
-    ],
+    prompt: buildDocumentExtractionPrompt(filename, contentType, text),
+    temperature: 0,
+    maxRetries: 2,
   });
 
-  const block = message.content.find((part) => part.type === 'text');
-  const raw = block && block.type === 'text' ? block.text : '';
-
   return {
-    ...parseExtraction(raw),
+    ...object,
     model: DOCUMENT_EXTRACTION_MODEL,
   };
-}
-
-/**
- * Parse the model's JSON answer. A model that answers with prose or with JSON
- * wrapped in a fence must not crash the upload, so an unparseable answer falls
- * back to an empty 'unknown' extraction.
- */
-function parseExtraction(raw: string): DocumentExtraction {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = (fenced ? fenced[1] : raw).trim();
-
-  try {
-    return documentExtractionSchema.parse(JSON.parse(candidate));
-  } catch {
-    return {
-      documentType: 'unknown',
-      issuer: null,
-      documentDate: null,
-      referenceNumber: null,
-      totalAmountCents: null,
-      currency: null,
-      lineItems: [],
-      summary: null,
-      containsMedicalData: false,
-    };
-  }
 }

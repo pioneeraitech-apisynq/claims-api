@@ -14,10 +14,20 @@ export async function embedQuery(text: string): Promise<number[]> {
   return embedding;
 }
 
+/** Maximum number of texts sent to embedMany in a single provider request. */
+const EMBED_BATCH_SIZE = 100;
+
 export async function embedClauses(texts: string[]): Promise<number[][]> {
-  const { embeddings } = await embedMany({
-    model: openai.embedding(EMBEDDING_MODEL),
-    values: texts,
-  });
-  return embeddings;
+  const results: number[][] = [];
+
+  for (let i = 0; i < texts.length; i += EMBED_BATCH_SIZE) {
+    const batch = texts.slice(i, i + EMBED_BATCH_SIZE);
+    const { embeddings } = await embedMany({
+      model: openai.embedding(EMBEDDING_MODEL),
+      values: batch,
+    });
+    results.push(...embeddings);
+  }
+
+  return results;
 }
