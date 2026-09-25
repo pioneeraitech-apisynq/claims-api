@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -160,7 +159,15 @@ export class ClaimsService {
     const claim = await this.findOne(claimId);
 
     if (!dto.force) {
-      const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      // A Redis outage during cache read is non-fatal: fall through to a fresh
+      // model run rather than surfacing a 500 to the caller.
+      let cached: TriageAgentOutput | null = null;
+      try {
+        cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[redis] readCachedTriage failed, bypassing cache', err);
+      }
       if (cached) {
         return cached;
       }
@@ -208,7 +215,16 @@ export class ClaimsService {
         )
         .exec();
 
-      await writeCachedTriage(claimId, result);
+      // A Redis outage during cache write is non-fatal: the result has already
+      // been persisted to MongoDB, so we return it and let the next call re-run
+      // the model if the cache is still unavailable.
+      try {
+        await writeCachedTriage(claimId, result);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[redis] writeCachedTriage failed, continuing', err);
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
