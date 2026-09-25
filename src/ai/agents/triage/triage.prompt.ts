@@ -54,23 +54,20 @@ export interface TriagePromptInput {
   coverageAmountCents: number;
   currency: string;
   fastTrackThresholdCents: number;
+  /** Kept for backward-compatibility; the RAG middleware ignores this field and
+   *  performs its own retrieval.  Pass an empty array from the agent. */
   clauses: PolicyClause[];
 }
 
 /**
- * Render the per-claim user prompt. The retrieved clauses are numbered so the
- * model can cite one by id.
+ * Render the per-claim user prompt.
+ *
+ * The narrative and productType are wrapped in HTML-comment markers so that the
+ * policy-wording RAG middleware can locate them, retrieve the relevant clauses
+ * from Pinecone, inject a "Retrieved policy wording:" section, and strip the
+ * markers — all before the text reaches the model.
  */
 export function buildTriagePrompt(input: TriagePromptInput): string {
-  const wording = input.clauses.length
-    ? input.clauses
-        .map(
-          (clause) =>
-            `[${clause.clauseId}] ${clause.heading}\n${clause.text}`,
-        )
-        .join('\n\n')
-    : 'No policy wording clauses were retrieved for this product.';
-
   return [
     `Claim: ${input.claimId}`,
     `Policy number: ${input.policyNumber} (${input.productType})`,
@@ -83,14 +80,12 @@ export function buildTriagePrompt(input: TriagePromptInput): string {
     `Fast-track threshold: ${input.fastTrackThresholdCents} ${input.currency}`,
     '',
     'Claim narrative:',
-    input.incidentNarrative,
+    `<!-- rag:narrative -->${input.incidentNarrative}<!-- /rag:narrative -->`,
+    `<!-- rag:productType -->${input.productType}<!-- /rag:productType -->`,
     '',
     input.medicalNotes
       ? `Medical notes attached to this claim:\n${input.medicalNotes}`
       : 'No medical notes are attached to this claim.',
-    '',
-    'Retrieved policy wording:',
-    wording,
   ]
     .filter((line) => line !== null)
     .join('\n');
