@@ -1,7 +1,7 @@
-import { generateObject } from 'ai';
+import { generateObject, wrapLanguageModel } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
-import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
+import { createPolicyWordingRagMiddleware } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
   buildTriagePrompt,
@@ -12,9 +12,10 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. Retrieval-augmented generation is handled transparently by the
+ * policy-wording RAG middleware, which embeds the claim narrative, queries
+ * Pinecone, and injects the relevant clauses into the prompt before the model
+ * is called — without the agent needing to orchestrate that flow itself.
  */
 
 export const triageResultSchema = z.object({
@@ -69,28 +70,30 @@ export interface TriageAgentInput
 
 export interface TriageAgentOutput extends TriageResult {
   model: string;
-  retrievedClauseIds: string[];
 }
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/** Model wrapped with the policy-wording RAG middleware. */
+const triageModel = wrapLanguageModel({
+  model: openai(TRIAGE_MODEL),
+  middleware: createPolicyWordingRagMiddleware(),
+});
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
-  );
-
   const promptInput: TriagePromptInput = {
     ...input,
     fastTrackThresholdCents:
       input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
+    // Clauses are injected by the RAG middleware; pass an empty array so the
+    // prompt builder omits the static wording section cleanly.
+    clauses: [],
   };
 
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model: triageModel,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
@@ -109,6 +112,5 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
   };
 }
