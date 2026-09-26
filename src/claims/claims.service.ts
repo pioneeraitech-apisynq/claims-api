@@ -18,12 +18,7 @@ import {
   getPayment,
 } from '../clients/payment-api.client';
 import { putClaimDocument } from '../storage/s3.client';
-import {
-  acquireTriageLock,
-  readCachedTriage,
-  releaseTriageLock,
-  writeCachedTriage,
-} from '../cache/redis.client';
+import { RedisClient } from '../cache/redis.client';
 import {
   runTriageAgent,
   type TriageAgentOutput,
@@ -34,6 +29,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    private readonly redisClient: RedisClient,
   ) {}
 
   /**
@@ -160,13 +156,13 @@ export class ClaimsService {
     const claim = await this.findOne(claimId);
 
     if (!dto.force) {
-      const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      const cached = await this.redisClient.readCachedTriage<TriageAgentOutput>(claimId);
       if (cached) {
         return cached;
       }
     }
 
-    const locked = await acquireTriageLock(claimId);
+    const locked = await this.redisClient.acquireTriageLock(claimId);
     if (!locked) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
@@ -208,10 +204,10 @@ export class ClaimsService {
         )
         .exec();
 
-      await writeCachedTriage(claimId, result);
+      await this.redisClient.writeCachedTriage(claimId, result);
       return result;
     } finally {
-      await releaseTriageLock(claimId);
+      await this.redisClient.releaseTriageLock(claimId);
     }
   }
 
