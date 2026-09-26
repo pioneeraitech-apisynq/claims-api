@@ -35,6 +35,9 @@ export class ClaimDocumentFile {
   extraction: Record<string, unknown> | null;
 }
 
+export const ClaimDocumentFileSchema =
+  SchemaFactory.createForClass(ClaimDocumentFile);
+
 @Schema({ _id: false })
 export class ClaimTriage {
   @Prop({ required: true })
@@ -80,6 +83,8 @@ export class ClaimTriage {
   triagedAt: string;
 }
 
+export const ClaimTriageSchema = SchemaFactory.createForClass(ClaimTriage);
+
 @Schema({ _id: false })
 export class ClaimSettlement {
   @Prop({ required: true })
@@ -97,6 +102,9 @@ export class ClaimSettlement {
   @Prop({ required: true })
   settledAt: string;
 }
+
+export const ClaimSettlementSchema =
+  SchemaFactory.createForClass(ClaimSettlement);
 
 @Schema({ collection: 'claims', timestamps: true })
 export class Claim {
@@ -146,16 +154,20 @@ export class Claim {
   @Prop({ required: true, default: 'filed', index: true })
   status: ClaimStatus;
 
-  @Prop({ type: [Object], default: [] })
+  @Prop({ type: [ClaimDocumentFileSchema], default: [] })
   documents: ClaimDocumentFile[];
 
-  @Prop({ type: Object, default: null })
+  @Prop({ type: ClaimTriageSchema, default: null })
   triage: ClaimTriage | null;
 
-  @Prop({ type: Object, default: null })
+  @Prop({ type: ClaimSettlementSchema, default: null })
   settlement: ClaimSettlement | null;
 }
 
 export type ClaimDocument = HydratedDocument<Claim>;
 
 export const ClaimSchema = SchemaFactory.createForClass(Claim);
+
+// Compound index to support list() queries that filter by policyNumber and
+// sort by createdAt descending, avoiding a collection scan or in-memory sort.
+ClaimSchema.index({ policyNumber: 1, createdAt: -1 });
