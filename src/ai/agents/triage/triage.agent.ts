@@ -74,6 +74,92 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Retry configuration that satisfies the OpenAI rate-limit best practice:
+ *  - Up to MAX_ATTEMPTS total attempts (1 original + MAX_ATTEMPTS-1 retries).
+ *  - On 429 / 503 the response `Retry-After` header is honoured when present.
+ *  - When the header is absent, full jitter exponential backoff is used:
+ *      delay = random(0, min(BASE_DELAY_MS * 2^attempt, MAX_DELAY_MS))
+ */
+const MAX_ATTEMPTS = 4;
+const BASE_DELAY_MS = 500;
+const MAX_DELAY_MS = 30_000;
+
+/** HTTP status codes that warrant a retry with back-off. */
+const RETRYABLE_STATUSES = new Set([429, 503]);
+
+function isRetryableError(err: unknown): boolean {
+  if (err == null || typeof err !== 'object') return false;
+  // The Vercel AI SDK surfaces rate-limit / overload errors as objects that
+  // carry a `statusCode` or `status` property.
+  const status =
+    (err as Record<string, unknown>)['statusCode'] ??
+    (err as Record<string, unknown>)['status'];
+  return typeof status === 'number' && RETRYABLE_STATUSES.has(status);
+}
+
+/**
+ * Extract a wait duration (ms) from a `Retry-After` header value if one is
+ * present on the error. The header may be an integer number of seconds or an
+ * HTTP-date string.
+ */
+function retryAfterMs(err: unknown): number | null {
+  if (err == null || typeof err !== 'object') return null;
+  const headers =
+    (err as Record<string, unknown>)['responseHeaders'] ??
+    (err as Record<string, unknown>)['headers'];
+  if (headers == null || typeof headers !== 'object') return null;
+
+  const raw =
+    (headers as Record<string, unknown>)['retry-after'] ??
+    (headers as Record<string, unknown>)['Retry-After'];
+  if (raw == null) return null;
+
+  const value = String(raw).trim();
+  // Integer seconds
+  if (/^\d+$/.test(value)) {
+    return parseInt(value, 10) * 1000;
+  }
+  // HTTP-date
+  const date = new Date(value);
+  if (!isNaN(date.getTime())) {
+    return Math.max(0, date.getTime() - Date.now());
+  }
+  return null;
+}
+
+function exponentialBackoffMs(attempt: number): number {
+  const ceiling = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
+  // Full jitter: avoids thundering-herd on simultaneous retries.
+  return Math.random() * ceiling;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wraps an async factory function with retry logic that respects `Retry-After`
+ * and falls back to exponential backoff for retryable OpenAI errors.
+ */
+async function withOpenAIRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRetryableError(err) || attempt === MAX_ATTEMPTS - 1) {
+        throw err;
+      }
+      lastError = err;
+      const waitMs = retryAfterMs(err) ?? exponentialBackoffMs(attempt);
+      await sleep(waitMs);
+    }
+  }
+  // Unreachable, but satisfies the TypeScript compiler.
+  throw lastError;
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,14 +175,18 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  // maxRetries is set to 0 so the SDK does not issue its own uncontrolled
+  // fixed-interval retries on top of the withOpenAIRetry wrapper above.
+  const { object } = await withOpenAIRetry(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+      temperature: 0.1,
+      maxRetries: 0,
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
