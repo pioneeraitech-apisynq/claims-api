@@ -19,7 +19,10 @@ let anthropic: Anthropic | null = null;
 
 function getAnthropic(): Anthropic {
   if (!anthropic) {
-    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    anthropic = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      defaultHeaders: { 'anthropic-version': '2026-09-24' },
+    });
   }
   return anthropic;
 }
