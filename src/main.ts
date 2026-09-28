@@ -6,6 +6,11 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
+  // Enable NestJS shutdown hooks so SIGTERM / SIGINT are forwarded to
+  // OnApplicationShutdown providers (e.g. RedisLifecycleService) before the
+  // process exits (finding 2).
+  app.enableShutdownHooks();
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
