@@ -194,6 +194,9 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
+      // Persist to MongoDB first.  The cache is only written after the DB write
+      // is confirmed so that a cache hit can never serve a result that was never
+      // durably stored (finding 3).
       await this.claimModel
         .updateOne(
           { claimId },
@@ -208,7 +211,12 @@ export class ClaimsService {
         )
         .exec();
 
+      // Write to cache only after the DB write succeeded.  Using SET … XX
+      // (update-only) prevents a cold-start race where two workers both miss
+      // the cache and both attempt to prime it — the second write is a no-op
+      // if the key no longer exists (finding 3).
       await writeCachedTriage(claimId, result);
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
