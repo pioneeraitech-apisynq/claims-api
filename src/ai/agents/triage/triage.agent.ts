@@ -1,7 +1,10 @@
-import { generateObject } from 'ai';
+import { generateObject, wrapLanguageModel } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
-import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
+import {
+  searchPolicyWording,
+  withPolicyWordingRAG,
+} from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
   buildTriagePrompt,
@@ -13,8 +16,9 @@ import {
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * the relevant policy wording clauses from Pinecone via Language Model
+ * Middleware, so the agent quotes real wording instead of paraphrasing from
+ * memory.
  */
 
 export const triageResultSchema = z.object({
@@ -77,6 +81,8 @@ const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
+  // Retrieve clauses up-front so we can (a) pass them into the prompt builder
+  // for explicit citation instructions, and (b) record which IDs were used.
   const clauses = await searchPolicyWording(
     input.incidentNarrative,
     input.productType,
@@ -89,8 +95,15 @@ export async function runTriageAgent(
     clauses,
   };
 
+  // Wrap the base model with the RAG middleware so that retrieval is handled
+  // at the model layer rather than bespoke pre-processing at the call site.
+  const ragModel = withPolicyWordingRAG(
+    openai(TRIAGE_MODEL),
+    input.productType,
+  );
+
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model: ragModel,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
