@@ -12,11 +12,50 @@ let client: Redis | null = null;
 export function getRedis(): Redis {
   if (!client) {
     client = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-      maxRetriesPerRequest: 2,
-      lazyConnect: false,
+      // null → unlimited per-request retries, governed solely by retryStrategy
+      // (finding 1: the previous value of 2 caused premature failures on transient
+      // network blips and left distributed locks held for the full TTL)
+      maxRetriesPerRequest: null,
+
+      // Exponential back-off capped at 5 s; ioredis stops retrying after
+      // ~30 s total by returning null from the strategy (finding 1).
+      retryStrategy(times: number): number | null {
+        if (times > 10) {
+          // Give up after ~10 attempts (~30 s total); let the command fail.
+          return null;
+        }
+        return Math.min(100 * 2 ** times, 5_000);
+      },
+
+      // lazyConnect: true → no TCP connection is opened until connectRedis()
+      // is called inside the NestJS OnModuleInit hook.  This means a failed
+      // Redis host surfaces as a clean bootstrap error rather than an
+      // unhandled promise rejection at module-import time (finding 4).
+      lazyConnect: true,
     });
   }
   return client;
+}
+
+/**
+ * Open the Redis connection.  Call this inside a NestJS OnModuleInit hook so
+ * that the connection is established during app bootstrap and any error is
+ * caught before the server starts accepting traffic (finding 4).
+ */
+export async function connectRedis(): Promise<void> {
+  await getRedis().connect();
+}
+
+/**
+ * Gracefully close the Redis connection.  Call this inside a NestJS
+ * OnApplicationShutdown hook so in-flight commands are drained before the
+ * process exits (finding 2).
+ */
+export async function closeRedis(): Promise<void> {
+  if (client) {
+    await client.quit();
+    client = null;
+  }
 }
 
 const LOCK_TTL_SECONDS = 60;
