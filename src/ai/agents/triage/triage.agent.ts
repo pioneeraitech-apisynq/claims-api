@@ -11,10 +11,10 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * Runs OpenAI gpt-4o-mini through the Vercel AI SDK's Responses API with a
+ * zod-constrained result. Before the model is called, the claim narrative is
+ * used to retrieve the relevant policy wording clauses from Pinecone, so the
+ * agent quotes real wording instead of paraphrasing from memory.
  */
 
 export const triageResultSchema = z.object({
@@ -74,6 +74,73 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/** Status codes that warrant a retry with backoff. */
+const RETRYABLE_STATUS_CODES = new Set([429, 503]);
+
+/**
+ * Retries `fn` up to `maxAttempts` times on 429 / 503 errors.
+ *
+ * - If the error response includes a `Retry-After` header (seconds), the delay
+ *   is at least that long, as required by the OpenAI best-practice guidance.
+ * - Otherwise exponential backoff is used: baseMs * 2^attempt + jitter.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 4,
+  baseMs = 500,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastError = err;
+
+      // Extract HTTP status and Retry-After from the error if present.
+      const status: number | undefined =
+        err != null &&
+        typeof err === 'object' &&
+        'status' in err &&
+        typeof (err as Record<string, unknown>).status === 'number'
+          ? ((err as Record<string, unknown>).status as number)
+          : undefined;
+
+      if (status === undefined || !RETRYABLE_STATUS_CODES.has(status)) {
+        throw err;
+      }
+
+      if (attempt === maxAttempts - 1) {
+        break;
+      }
+
+      // Honour Retry-After when the server sends it.
+      const retryAfterHeader: string | undefined =
+        err != null &&
+        typeof err === 'object' &&
+        'headers' in err &&
+        err.headers != null &&
+        typeof (err as Record<string, unknown>).headers === 'object'
+          ? ((err as Record<string, { 'retry-after'?: string }>).headers[
+              'retry-after'
+            ] as string | undefined)
+          : undefined;
+
+      const retryAfterMs = retryAfterHeader
+        ? parseFloat(retryAfterHeader) * 1_000
+        : NaN;
+
+      const backoffMs = baseMs * Math.pow(2, attempt);
+      const jitterMs = Math.random() * baseMs;
+      const delayMs = Number.isFinite(retryAfterMs)
+        ? Math.max(retryAfterMs, backoffMs + jitterMs)
+        : backoffMs + jitterMs;
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,14 +156,17 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  // Use the Responses API (openai.responses) — the recommended interface for
+  // agentic / tool-calling workflows. `temperature` is omitted for forward-
+  // compatibility with GPT-6 Astra, which does not accept that parameter.
+  const { object } = await withRetry(() =>
+    generateObject({
+      model: openai.responses(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
