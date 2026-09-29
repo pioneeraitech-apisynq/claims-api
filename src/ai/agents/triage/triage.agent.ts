@@ -65,6 +65,7 @@ export type TriageResult = z.infer<typeof triageResultSchema>;
 export interface TriageAgentInput
   extends Omit<TriagePromptInput, 'clauses' | 'fastTrackThresholdCents'> {
   fastTrackThresholdCents?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface TriageAgentOutput extends TriageResult {
@@ -96,6 +97,7 @@ export async function runTriageAgent(
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
     maxRetries: 2,
+    abortSignal: input.abortSignal,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
