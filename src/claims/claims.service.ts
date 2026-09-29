@@ -156,6 +156,7 @@ export class ClaimsService {
   async triage(
     claimId: string,
     dto: TriageClaimDto,
+    abortSignal?: AbortSignal,
   ): Promise<TriageAgentOutput> {
     const claim = await this.findOne(claimId);
 
@@ -192,6 +193,7 @@ export class ClaimsService {
         coverageAmountCents: policy.coverageAmountCents,
         currency: coverage.currency,
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
+        abortSignal,
       });
 
       await this.claimModel
