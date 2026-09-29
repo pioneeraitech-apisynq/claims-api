@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, Req } from '@nestjs/common';
+import { Request } from 'express';
 import { ClaimsService } from './claims.service';
 import { CreateClaimDto } from './dto/create-claim.dto';
 import { ListClaimsQuery } from './dto/list-claims.query';
@@ -39,8 +40,18 @@ export class ClaimsController {
 
   // POST /v1/claims/:claimId/triage
   @Post(':claimId/triage')
-  triage(@Param('claimId') claimId: string, @Body() dto: TriageClaimDto) {
-    return this.claimsService.triage(claimId, dto);
+  triage(
+    @Param('claimId') claimId: string,
+    @Body() dto: TriageClaimDto,
+    @Req() req: Request,
+  ) {
+    return this.claimsService.triage(claimId, dto, req.socket.destroyed
+      ? AbortSignal.abort()
+      : (() => {
+          const ac = new AbortController();
+          req.socket.once('close', () => ac.abort());
+          return ac.signal;
+        })());
   }
 
   // POST /v1/claims/:claimId/settle
