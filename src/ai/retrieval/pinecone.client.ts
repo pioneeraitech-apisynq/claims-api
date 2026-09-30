@@ -19,5 +19,13 @@ export function policyWordingIndex() {
   return getPinecone().index(indexName);
 }
 
-export const POLICY_WORDING_NAMESPACE =
-  process.env.PINECONE_NAMESPACE || 'policy-wording-v1';
+/**
+ * Returns the namespace for the given product type, e.g. `policy-wording-home`
+ * or `policy-wording-auto`. Keeping one namespace per product type lets
+ * Pinecone route each query within a small, focused namespace instead of
+ * scanning the entire shared index and applying a metadata filter.
+ */
+export function policyWordingNamespace(productType: string): string {
+  const prefix = process.env.PINECONE_NAMESPACE_PREFIX || 'policy-wording';
+  return `${prefix}-${productType}`;
+}
