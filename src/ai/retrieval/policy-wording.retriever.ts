@@ -1,5 +1,5 @@
 import { embedClauses, embedQuery } from './embeddings';
-import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client';
+import { policyWordingIndex, policyWordingNamespace } from './pinecone.client';
 
 /**
  * Retrieval-augmented search over policy wording.
@@ -7,6 +7,11 @@ import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client'
  * The claim narrative is embedded and matched against the clause index in
  * Pinecone. The top clauses are handed to the triage agent so its decision
  * cites the wording it relied on rather than inventing one.
+ *
+ * Each product type is stored in its own namespace (e.g. `policy-wording-home`,
+ * `policy-wording-auto`). Namespace-based routing removes the need for a
+ * metadata filter and keeps each query inside a small, focused namespace,
+ * reducing per-query RU cost.
  */
 
 export interface PolicyClause {
@@ -25,12 +30,11 @@ export async function searchPolicyWording(
   const vector = await embedQuery(narrative);
 
   const result = await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+    .namespace(policyWordingNamespace(productType))
     .query({
       vector,
       topK,
       includeMetadata: true,
-      filter: { productType: { $eq: productType } },
     });
 
   return (result.matches || []).map((match) => {
@@ -56,13 +60,12 @@ export async function indexPolicyWording(
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
   await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+    .namespace(policyWordingNamespace(productType))
     .upsert(
       clauses.map((clause, index) => ({
         id: clause.clauseId,
         values: vectors[index],
         metadata: {
-          productType,
           heading: clause.heading,
           text: clause.text,
         },
