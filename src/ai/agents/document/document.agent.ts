@@ -8,12 +8,12 @@ import {
 /**
  * Claim document extraction agent.
  *
- * Runs Anthropic claude-sonnet-4-5 over the text of an uploaded claim document
+ * Runs Anthropic claude-sonnet-5-5-20251015 over the text of an uploaded claim document
  * and returns the fields the adjuster and the triage agent need: who issued it,
  * when, what it totals, and whether it carries medical data.
  */
 
-export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-4-5';
+export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-5-5-20251015';
 
 let anthropic: Anthropic | null = null;
 
