@@ -1,12 +1,14 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
+import Redis from 'ioredis';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
 import { SettleClaimDto } from './dto/settle-claim.dto';
@@ -23,6 +25,7 @@ import {
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
+  REDIS_CLIENT,
 } from '../cache/redis.client';
 import {
   runTriageAgent,
@@ -34,6 +37,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {}
 
   /**
@@ -160,13 +164,13 @@ export class ClaimsService {
     const claim = await this.findOne(claimId);
 
     if (!dto.force) {
-      const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      const cached = await readCachedTriage<TriageAgentOutput>(this.redis, claimId);
       if (cached) {
         return cached;
       }
     }
 
-    const locked = await acquireTriageLock(claimId);
+    const locked = await acquireTriageLock(this.redis, claimId);
     if (!locked) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
@@ -208,10 +212,10 @@ export class ClaimsService {
         )
         .exec();
 
-      await writeCachedTriage(claimId, result);
+      await writeCachedTriage(this.redis, claimId, result);
       return result;
     } finally {
-      await releaseTriageLock(claimId);
+      await releaseTriageLock(this.redis, claimId);
     }
   }
 
