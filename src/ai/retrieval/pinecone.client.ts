@@ -9,6 +9,11 @@ let pinecone: Pinecone | null = null;
 
 export function getPinecone(): Pinecone {
   if (!pinecone) {
+    if (!process.env.PINECONE_API_KEY) {
+      throw new Error(
+        'PINECONE_API_KEY is required but was not set in the environment.',
+      );
+    }
     pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
   }
   return pinecone;
