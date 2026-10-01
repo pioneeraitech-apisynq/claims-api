@@ -3,10 +3,12 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { ClaimsController } from './claims.controller';
 import { ClaimsService } from './claims.service';
 import { Claim, ClaimSchema } from './schemas/claim.schema';
+import { RedisModule } from '../cache/redis.client';
 
 @Module({
   imports: [
     MongooseModule.forFeature([{ name: Claim.name, schema: ClaimSchema }]),
+    RedisModule,
   ],
   controllers: [ClaimsController],
   providers: [ClaimsService],
