@@ -12,7 +12,7 @@ let client: Redis | null = null;
 export function getRedis(): Redis {
   if (!client) {
     client = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-      maxRetriesPerRequest: 2,
+      maxRetriesPerRequest: 5,
       lazyConnect: false,
     });
   }
