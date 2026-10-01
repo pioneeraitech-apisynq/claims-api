@@ -17,6 +17,61 @@ export interface PolicyClause {
   score: number;
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the Pinecone namespace for a given product type.
+ *
+ * Storing each product type in its own namespace avoids the cost of a
+ * full-corpus metadata filter at query time (finding 4 — per-productType
+ * namespace isolation).
+ */
+function namespaceFor(productType: string): string {
+  return `${POLICY_WORDING_NAMESPACE}-${productType}`;
+}
+
+/**
+ * Calls `fn` with exponential back-off whenever Pinecone responds with a
+ * 429 TOO_MANY_REQUESTS (rate-limit) error (finding 1).
+ *
+ * Strategy: up to `maxAttempts` tries; first retry waits `baseDelayMs`,
+ * each subsequent wait doubles plus a small random jitter to spread bursts.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  {
+    maxAttempts = 5,
+    baseDelayMs = 200,
+  }: { maxAttempts?: number; baseDelayMs?: number } = {},
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      attempt += 1;
+      const isRateLimit =
+        err instanceof Error &&
+        (err.message.includes('429') ||
+          err.message.toLowerCase().includes('too many requests'));
+
+      if (!isRateLimit || attempt >= maxAttempts) {
+        throw err;
+      }
+
+      const jitterMs = Math.random() * baseDelayMs;
+      const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 export async function searchPolicyWording(
   narrative: string,
   productType: string,
@@ -24,23 +79,26 @@ export async function searchPolicyWording(
 ): Promise<PolicyClause[]> {
   const vector = await embedQuery(narrative);
 
-  const result = await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
-    .query({
-      vector,
-      topK,
-      includeMetadata: true,
-      filter: { productType: { $eq: productType } },
-    });
+  // Finding 3: use the Documents API (2026-07) `searchRecords` instead of the
+  // legacy `query` vector endpoint.
+  // Finding 4: query only the per-productType namespace — no metadata filter needed.
+  const result = await withRetry(() =>
+    policyWordingIndex()
+      .namespace(namespaceFor(productType))
+      .searchRecords({
+        query: { inputs: { vector }, topK },
+        fields: ['productType', 'heading', 'text'],
+      }),
+  );
 
-  return (result.matches || []).map((match) => {
-    const metadata = (match.metadata || {}) as Record<string, unknown>;
+  return (result.result?.hits || []).map((hit) => {
+    const fields = (hit.fields || {}) as Record<string, unknown>;
     return {
-      clauseId: match.id,
-      productType: String(metadata.productType || productType),
-      heading: String(metadata.heading || ''),
-      text: String(metadata.text || ''),
-      score: match.score ?? 0,
+      clauseId: hit._id,
+      productType: String(fields.productType || productType),
+      heading: String(fields.heading || ''),
+      text: String(fields.text || ''),
+      score: hit._score ?? 0,
     };
   });
 }
@@ -55,19 +113,22 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
-    .upsert(
-      clauses.map((clause, index) => ({
-        id: clause.clauseId,
-        values: vectors[index],
-        metadata: {
+  // Finding 3: use the Documents API `upsertRecords` instead of the legacy
+  // `upsert` vector endpoint.
+  // Finding 4: write into the per-productType namespace.
+  await withRetry(() =>
+    policyWordingIndex()
+      .namespace(namespaceFor(productType))
+      .upsertRecords(
+        clauses.map((clause, index) => ({
+          id: clause.clauseId,
+          values: vectors[index],
           productType,
           heading: clause.heading,
           text: clause.text,
-        },
-      })),
-    );
+        })),
+      ),
+  );
 
   return clauses.length;
 }
