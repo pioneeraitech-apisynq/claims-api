@@ -1,4 +1,4 @@
-import { generateObject } from 'ai';
+import { generateObject, APICallError } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
@@ -16,6 +16,54 @@ import {
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
  */
+
+// ---------------------------------------------------------------------------
+// Retry helper – respects Retry-After on 429/503, exponential back-off otherwise
+// ---------------------------------------------------------------------------
+
+const RETRYABLE_STATUSES = new Set([429, 503]);
+const MAX_ATTEMPTS = 4; // 1 initial + 3 retries
+const BASE_DELAY_MS = 500;
+const MAX_DELAY_MS = 30_000;
+
+async function withOpenAIRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      attempt += 1;
+      const isRetryable =
+        err instanceof APICallError &&
+        err.statusCode !== undefined &&
+        RETRYABLE_STATUSES.has(err.statusCode);
+
+      if (!isRetryable || attempt >= MAX_ATTEMPTS) {
+        throw err;
+      }
+
+      // Honour Retry-After header when the server provides one (value in seconds).
+      const retryAfterRaw =
+        err instanceof APICallError
+          ? (err.responseHeaders?.['retry-after'] ?? null)
+          : null;
+      const retryAfterMs = retryAfterRaw
+        ? parseFloat(retryAfterRaw) * 1_000
+        : null;
+
+      const backoffMs = Math.min(
+        BASE_DELAY_MS * 2 ** (attempt - 1),
+        MAX_DELAY_MS,
+      );
+      const delayMs =
+        retryAfterMs !== null && retryAfterMs > 0 ? retryAfterMs : backoffMs;
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 export const triageResultSchema = z.object({
   recommendation: z
@@ -89,14 +137,16 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  const { object } = await withOpenAIRetry(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+      temperature: 0.1,
+      maxRetries: 0, // retries are handled by withOpenAIRetry above
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
