@@ -80,6 +80,8 @@ export class ClaimTriage {
   triagedAt: string;
 }
 
+export const ClaimTriageSchema = SchemaFactory.createForClass(ClaimTriage);
+
 @Schema({ _id: false })
 export class ClaimSettlement {
   @Prop({ required: true })
@@ -97,6 +99,8 @@ export class ClaimSettlement {
   @Prop({ required: true })
   settledAt: string;
 }
+
+export const ClaimSettlementSchema = SchemaFactory.createForClass(ClaimSettlement);
 
 @Schema({ collection: 'claims', timestamps: true })
 export class Claim {
@@ -149,13 +153,17 @@ export class Claim {
   @Prop({ type: [Object], default: [] })
   documents: ClaimDocumentFile[];
 
-  @Prop({ type: Object, default: null })
+  @Prop({ type: ClaimTriageSchema, default: null })
   triage: ClaimTriage | null;
 
-  @Prop({ type: Object, default: null })
+  @Prop({ type: ClaimSettlementSchema, default: null })
   settlement: ClaimSettlement | null;
 }
 
 export type ClaimDocument = HydratedDocument<Claim>;
 
 export const ClaimSchema = SchemaFactory.createForClass(Claim);
+
+// Covers the optional policyNumber equality filter and the createdAt: -1 sort
+// used by the list() query, avoiding a full collection scan.
+ClaimSchema.index({ policyNumber: 1, createdAt: -1 });
