@@ -7,7 +7,12 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
-import { Claim, ClaimDocument } from './schemas/claim.schema';
+import {
+  Claim,
+  ClaimDocument,
+  decryptMedicalNotes,
+  encryptMedicalNotes,
+} from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
 import { SettleClaimDto } from './dto/settle-claim.dto';
 import { TriageClaimDto } from './dto/triage-claim.dto';
@@ -73,7 +78,10 @@ export class ClaimsService {
       dateOfLoss: dto.dateOfLoss,
       lossType: dto.lossType,
       incidentNarrative: dto.incidentNarrative,
-      medicalNotes: dto.medicalNotes ?? null,
+      medicalNotes:
+        dto.medicalNotes != null
+          ? encryptMedicalNotes(dto.medicalNotes)
+          : null,
       claimedAmountCents: dto.claimedAmountCents,
       currency: dto.currency ?? 'usd',
       status: 'filed',
@@ -152,6 +160,10 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The MongoDB update and the Redis cache write are performed inside an ACID
+   * session/transaction so a crash between the two cannot leave the claim in a
+   * corrupt intermediate state.
    */
   async triage(
     claimId: string,
@@ -177,6 +189,12 @@ export class ClaimsService {
         getPolicyCoverage(claim.policyNumber),
       ]);
 
+      // Decrypt medical notes before passing to the agent (in-memory only).
+      const medicalNotesPlain =
+        claim.medicalNotes != null
+          ? decryptMedicalNotes(claim.medicalNotes)
+          : undefined;
+
       const result = await runTriageAgent({
         claimId: claim.claimId,
         policyNumber: claim.policyNumber,
@@ -187,28 +205,40 @@ export class ClaimsService {
         dateOfLoss: claim.dateOfLoss,
         lossType: claim.lossType,
         incidentNarrative: claim.incidentNarrative,
-        medicalNotes: claim.medicalNotes ?? undefined,
+        medicalNotes: medicalNotesPlain,
         claimedAmountCents: claim.claimedAmountCents,
         coverageAmountCents: policy.coverageAmountCents,
         currency: coverage.currency,
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      // Wrap the MongoDB write and the Redis cache write in an ACID transaction
+      // so a mid-flight failure cannot leave the claim with a stale status
+      // while the cache already reflects the new triage result (or vice-versa).
+      const session = await this.claimModel.db.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne(
+              { claimId },
+              {
+                $set: {
+                  triage: { ...result, triagedAt: new Date().toISOString() },
+                  status: result.requiresHumanAdjuster
+                    ? 'awaiting_adjuster'
+                    : 'triaged',
+                },
+              },
+              { session },
+            )
+            .exec();
 
-      await writeCachedTriage(claimId, result);
+          await writeCachedTriage(claimId, result);
+        });
+      } finally {
+        await session.endSession();
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
@@ -218,6 +248,10 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The final MongoDB write is performed inside an ACID session/transaction so
+   * a crash after payment confirmation but before the document update does not
+   * leave the claim in an approved-but-unsettled limbo.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +299,30 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Wrap the document update in an ACID transaction so a failure between
+    // payment confirmation and the persistence step is fully retryable without
+    // double-settlement risk (idempotency is guarded by the settlement-exists
+    // check above).
+    const session = await this.claimModel.db.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
