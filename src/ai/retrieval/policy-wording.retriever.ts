@@ -55,7 +55,7 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
+  const response = await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
     .upsert(
       clauses.map((clause, index) => ({
@@ -68,6 +68,20 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  if (response.errors && response.errors.length > 0) {
+    throw new Error(
+      `Pinecone upsert completed with errors for productType "${productType}": ` +
+        JSON.stringify(response.errors),
+    );
+  }
+
+  if (response.upsertedCount !== clauses.length) {
+    throw new Error(
+      `Pinecone upsert partial failure for productType "${productType}": ` +
+        `expected ${clauses.length} vectors, got ${response.upsertedCount ?? 0}.`,
+    );
+  }
 
   return clauses.length;
 }
