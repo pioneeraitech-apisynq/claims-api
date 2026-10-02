@@ -1,5 +1,60 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+
+// ---------------------------------------------------------------------------
+// Field-level encryption helpers for medicalNotes (PHI / health data).
+//
+// MEDICAL_NOTES_KEY must be a 32-byte (256-bit) hex-encoded secret stored in
+// your secrets manager and injected via environment variable. If absent the
+// service refuses to handle medical notes.  Algorithm: AES-256-GCM with a
+// random 96-bit IV prepended to the ciphertext, followed by the 16-byte auth
+// tag – all base64-encoded as a single string so storage is transparent.
+//
+// Format: base64( iv[12] || tag[16] || ciphertext )
+// ---------------------------------------------------------------------------
+
+const ALGORITHM = 'aes-256-gcm';
+const IV_BYTES = 12;
+const TAG_BYTES = 16;
+
+function getMedicalNotesKey(): Buffer {
+  const hex = process.env.MEDICAL_NOTES_KEY;
+  if (!hex || hex.length !== 64) {
+    throw new Error(
+      'MEDICAL_NOTES_KEY environment variable must be a 64-char hex string ' +
+        '(32 bytes / 256-bit AES key). Set it in your secrets manager.',
+    );
+  }
+  return Buffer.from(hex, 'hex');
+}
+
+export function encryptMedicalNotes(plaintext: string): string {
+  const key = getMedicalNotesKey();
+  const iv = randomBytes(IV_BYTES);
+  const cipher = createCipheriv(ALGORITHM, key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(plaintext, 'utf8'),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString('base64');
+}
+
+export function decryptMedicalNotes(ciphertext: string): string {
+  const key = getMedicalNotesKey();
+  const buf = Buffer.from(ciphertext, 'base64');
+  const iv = buf.subarray(0, IV_BYTES);
+  const tag = buf.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
+  const encrypted = buf.subarray(IV_BYTES + TAG_BYTES);
+  const decipher = createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(tag);
+  return (
+    decipher.update(encrypted, undefined, 'utf8') + decipher.final('utf8')
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export type ClaimStatus =
   | 'filed'
@@ -106,7 +161,7 @@ export class Claim {
   @Prop({ required: true, index: true })
   policyNumber: string;
 
-  @Prop({ required: true })
+  @Prop({ required: true, index: true })
   customerId: string;
 
   @Prop({ required: true })
@@ -133,6 +188,9 @@ export class Claim {
   /**
    * Free-text medical notes supplied on bodily-injury claims. Health data: read
    * by the triage agent, never returned in list responses.
+   *
+   * Stored as AES-256-GCM ciphertext (base64). Use encryptMedicalNotes /
+   * decryptMedicalNotes from this module to read or write the value.
    */
   @Prop({ default: null })
   medicalNotes: string | null;
