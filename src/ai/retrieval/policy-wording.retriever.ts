@@ -55,7 +55,7 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
+  const response = await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
     .upsert(
       clauses.map((clause, index) => ({
@@ -68,6 +68,12 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  if (response.errors && response.errors.length > 0) {
+    throw new Error(
+      `Pinecone upsert for productType "${productType}" completed with errors: ${JSON.stringify(response.errors)}`,
+    );
+  }
 
   return clauses.length;
 }
