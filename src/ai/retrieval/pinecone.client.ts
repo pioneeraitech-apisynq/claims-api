@@ -9,7 +9,10 @@ let pinecone: Pinecone | null = null;
 
 export function getPinecone(): Pinecone {
   if (!pinecone) {
-    pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+    pinecone = new Pinecone({
+      apiKey: process.env.PINECONE_API_KEY,
+      apiVersion: '2026-07',
+    });
   }
   return pinecone;
 }
