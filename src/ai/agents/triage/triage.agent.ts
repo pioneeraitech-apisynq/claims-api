@@ -74,8 +74,13 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * An optional AbortSignal can be supplied so the in-flight LLM request is
+ * cancelled when the HTTP client disconnects (finding #2).
+ */
 export async function runTriageAgent(
   input: TriageAgentInput,
+  abortSignal?: AbortSignal,
 ): Promise<TriageAgentOutput> {
   const clauses = await searchPolicyWording(
     input.incidentNarrative,
@@ -96,6 +101,7 @@ export async function runTriageAgent(
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
     maxRetries: 2,
+    abortSignal,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a

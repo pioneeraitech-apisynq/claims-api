@@ -1,4 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { generateObject } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import {
   DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
@@ -14,15 +15,6 @@ import {
  */
 
 export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-4-5';
-
-let anthropic: Anthropic | null = null;
-
-function getAnthropic(): Anthropic {
-  if (!anthropic) {
-    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  }
-  return anthropic;
-}
 
 export const documentExtractionSchema = z.object({
   documentType: z.enum([
@@ -59,56 +51,28 @@ export interface DocumentExtractionOutput extends DocumentExtraction {
 /**
  * Extract fields from one claim document. The caller passes the document's text
  * layer; binary formats are converted upstream.
+ *
+ * An optional AbortSignal can be supplied so the in-flight LLM request is
+ * cancelled when the HTTP client disconnects (finding #2 / #3).
  */
 export async function runDocumentExtractionAgent(
   filename: string,
   contentType: string,
   text: string,
+  abortSignal?: AbortSignal,
 ): Promise<DocumentExtractionOutput> {
-  const message = await getAnthropic().messages.create({
-    model: DOCUMENT_EXTRACTION_MODEL,
-    max_tokens: 2048,
-    temperature: 0,
+  const { object } = await generateObject({
+    model: anthropic(DOCUMENT_EXTRACTION_MODEL),
+    schema: documentExtractionSchema,
     system: DOCUMENT_EXTRACTION_SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: buildDocumentExtractionPrompt(filename, contentType, text),
-      },
-    ],
+    prompt: buildDocumentExtractionPrompt(filename, contentType, text),
+    temperature: 0,
+    maxRetries: 2,
+    abortSignal,
   });
 
-  const block = message.content.find((part) => part.type === 'text');
-  const raw = block && block.type === 'text' ? block.text : '';
-
   return {
-    ...parseExtraction(raw),
+    ...object,
     model: DOCUMENT_EXTRACTION_MODEL,
   };
-}
-
-/**
- * Parse the model's JSON answer. A model that answers with prose or with JSON
- * wrapped in a fence must not crash the upload, so an unparseable answer falls
- * back to an empty 'unknown' extraction.
- */
-function parseExtraction(raw: string): DocumentExtraction {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = (fenced ? fenced[1] : raw).trim();
-
-  try {
-    return documentExtractionSchema.parse(JSON.parse(candidate));
-  } catch {
-    return {
-      documentType: 'unknown',
-      issuer: null,
-      documentDate: null,
-      referenceNumber: null,
-      totalAmountCents: null,
-      currency: null,
-      lineItems: [],
-      summary: null,
-      containsMedicalData: false,
-    };
-  }
 }
