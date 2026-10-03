@@ -35,6 +35,8 @@ export class ClaimDocumentFile {
   extraction: Record<string, unknown> | null;
 }
 
+const ClaimDocumentFileSchema = SchemaFactory.createForClass(ClaimDocumentFile);
+
 @Schema({ _id: false })
 export class ClaimTriage {
   @Prop({ required: true })
@@ -80,6 +82,8 @@ export class ClaimTriage {
   triagedAt: string;
 }
 
+const ClaimTriageSchema = SchemaFactory.createForClass(ClaimTriage);
+
 @Schema({ _id: false })
 export class ClaimSettlement {
   @Prop({ required: true })
@@ -97,6 +101,8 @@ export class ClaimSettlement {
   @Prop({ required: true })
   settledAt: string;
 }
+
+const ClaimSettlementSchema = SchemaFactory.createForClass(ClaimSettlement);
 
 @Schema({ collection: 'claims', timestamps: true })
 export class Claim {
@@ -133,6 +139,11 @@ export class Claim {
   /**
    * Free-text medical notes supplied on bodily-injury claims. Health data: read
    * by the triage agent, never returned in list responses.
+   *
+   * TODO: protect this field with MongoDB Client-Side Field Level Encryption
+   * (CSFLE) / Queryable Encryption before production to ensure PHI is never
+   * stored in plaintext at the database layer (finding: sensitive health data
+   * stored as plain text without field-level encryption).
    */
   @Prop({ default: null })
   medicalNotes: string | null;
@@ -146,16 +157,24 @@ export class Claim {
   @Prop({ required: true, default: 'filed', index: true })
   status: ClaimStatus;
 
-  @Prop({ type: [Object], default: [] })
+  // Typed sub-schemas allow MongoDB to generate correct BSON type information,
+  // enabling dot-path indexing and native query capabilities on nested fields.
+  @Prop({ type: [ClaimDocumentFileSchema], default: [] })
   documents: ClaimDocumentFile[];
 
-  @Prop({ type: Object, default: null })
+  @Prop({ type: ClaimTriageSchema, default: null })
   triage: ClaimTriage | null;
 
-  @Prop({ type: Object, default: null })
+  @Prop({ type: ClaimSettlementSchema, default: null })
   settlement: ClaimSettlement | null;
 }
 
 export type ClaimDocument = HydratedDocument<Claim>;
 
 export const ClaimSchema = SchemaFactory.createForClass(Claim);
+
+// Index supporting list() which sorts by createdAt descending (unbounded case).
+ClaimSchema.index({ createdAt: -1 });
+
+// Compound index for the common filtered case: list by policy, newest first.
+ClaimSchema.index({ policyNumber: 1, createdAt: -1 });
