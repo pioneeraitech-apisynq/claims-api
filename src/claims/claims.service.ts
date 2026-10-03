@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel, InjectConnection } from '@nestjs/mongoose';
+import { Model, Connection } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -218,6 +219,11 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The MongoDB write is performed inside an ACID session so that, if the
+   * write fails (e.g. primary failover), the caller receives an error and can
+   * reconcile rather than silently leaving the claim un-settled after the
+   * payment has already been booked.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +271,30 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Use a session-backed transaction so the settlement write is atomic and
+    // retryable. If the write fails after the Payment API has already booked
+    // the payout, the exception surfaces to the caller for manual reconciliation
+    // rather than silently leaving the claim record stale.
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
