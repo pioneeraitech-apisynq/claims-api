@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -20,6 +19,7 @@ import {
 import { putClaimDocument } from '../storage/s3.client';
 import {
   acquireTriageLock,
+  deleteCachedTriage,
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
@@ -111,6 +111,9 @@ export class ClaimsService {
    * Upload a claim document. The bytes go to S3; the document extraction agent
    * reads the supplied text layer and the extracted fields are stored alongside
    * the object key.
+   *
+   * Any cached triage result is evicted so the next triage call runs against
+   * the full, up-to-date claim state (finding #8).
    */
   async addDocument(claimId: string, dto: UploadDocumentDto) {
     const claim = await this.findOne(claimId);
@@ -143,6 +146,10 @@ export class ClaimsService {
       .updateOne({ claimId }, { $push: { documents: document } })
       .exec();
 
+    // Evict the cached triage result so a subsequent triage call re-runs the
+    // model against the claim's current document set (finding #8).
+    await deleteCachedTriage(claimId);
+
     return document;
   }
 
@@ -166,8 +173,10 @@ export class ClaimsService {
       }
     }
 
-    const locked = await acquireTriageLock(claimId);
-    if (!locked) {
+    // acquireTriageLock now returns a unique random token (not process.pid) so
+    // ownership is unambiguous across container instances (finding #7).
+    const lockToken = await acquireTriageLock(claimId);
+    if (!lockToken) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
 
@@ -208,10 +217,13 @@ export class ClaimsService {
         )
         .exec();
 
-      await writeCachedTriage(claimId, result);
+      await writeCachedTriage(claimId, result as unknown as Record<string, unknown>);
       return result;
     } finally {
-      await releaseTriageLock(claimId);
+      // Pass the ownership token so the Lua script can verify ownership before
+      // deleting — safe even if the TTL expired and a new owner took the lock
+      // (finding #1).
+      await releaseTriageLock(claimId, lockToken);
     }
   }
 
