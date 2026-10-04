@@ -20,6 +20,7 @@ import {
 import { putClaimDocument } from '../storage/s3.client';
 import {
   acquireTriageLock,
+  invalidateCachedTriage,
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
@@ -111,6 +112,9 @@ export class ClaimsService {
    * Upload a claim document. The bytes go to S3; the document extraction agent
    * reads the supplied text layer and the extracted fields are stored alongside
    * the object key.
+   *
+   * Any cached triage result is invalidated so that a subsequent triage() call
+   * reflects the newly uploaded evidence rather than returning a stale result.
    */
   async addDocument(claimId: string, dto: UploadDocumentDto) {
     const claim = await this.findOne(claimId);
@@ -142,6 +146,10 @@ export class ClaimsService {
     await this.claimModel
       .updateOne({ claimId }, { $push: { documents: document } })
       .exec();
+
+    // Invalidate the cached triage result so the next triage() call uses the
+    // updated document set rather than a stale cached decision (finding 2).
+    await invalidateCachedTriage(claimId);
 
     return document;
   }
