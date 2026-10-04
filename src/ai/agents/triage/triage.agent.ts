@@ -94,7 +94,6 @@ export async function runTriageAgent(
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
     maxRetries: 2,
   });
 
