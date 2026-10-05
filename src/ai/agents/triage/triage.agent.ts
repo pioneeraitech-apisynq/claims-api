@@ -15,6 +15,10 @@ import {
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
+ *
+ * An optional `abortSignal` (derived from the HTTP request lifecycle) is wired
+ * into `generateObject` so that a client disconnect cancels the upstream
+ * OpenAI stream and the Pinecone embedding requests immediately.
  */
 
 export const triageResultSchema = z.object({
@@ -65,6 +69,8 @@ export type TriageResult = z.infer<typeof triageResultSchema>;
 export interface TriageAgentInput
   extends Omit<TriagePromptInput, 'clauses' | 'fastTrackThresholdCents'> {
   fastTrackThresholdCents?: number;
+  /** Propagated from the HTTP request so a client disconnect cancels the stream. */
+  abortSignal?: AbortSignal;
 }
 
 export interface TriageAgentOutput extends TriageResult {
@@ -96,6 +102,7 @@ export async function runTriageAgent(
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
     maxRetries: 2,
+    abortSignal: input.abortSignal,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
