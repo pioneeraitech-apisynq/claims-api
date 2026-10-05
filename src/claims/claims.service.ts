@@ -152,10 +152,15 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * An optional `abortSignal` (derived from the HTTP request lifecycle) is
+   * forwarded to the triage agent so a client disconnect cancels the upstream
+   * model stream immediately.
    */
   async triage(
     claimId: string,
     dto: TriageClaimDto,
+    abortSignal?: AbortSignal,
   ): Promise<TriageAgentOutput> {
     const claim = await this.findOne(claimId);
 
@@ -192,6 +197,7 @@ export class ClaimsService {
         coverageAmountCents: policy.coverageAmountCents,
         currency: coverage.currency,
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
+        abortSignal,
       });
 
       await this.claimModel
