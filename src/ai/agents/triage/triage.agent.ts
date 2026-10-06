@@ -1,4 +1,4 @@
-import { generateObject } from 'ai';
+import { generateObject, AISDKError } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
@@ -89,14 +89,28 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  let object: TriageResult;
+  try {
+    ({ object } = await generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+      temperature: 0.1,
+      maxRetries: 2,
+    }));
+  } catch (err) {
+    if (AISDKError.isInstance(err)) {
+      // SDK-level failure (e.g. InvalidResponseDataError, model rejection).
+      // Re-throw with a clear message so callers can map it to a 502 Bad Gateway
+      // rather than an opaque 500.
+      throw Object.assign(
+        new Error(`Triage model error [${err.name}]: ${err.message}`),
+        { cause: err, isSdkError: true },
+      );
+    }
+    throw err;
+  }
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
