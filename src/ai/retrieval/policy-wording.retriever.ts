@@ -55,7 +55,7 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
+  const upsertResponse = await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
     .upsert(
       clauses.map((clause, index) => ({
@@ -68,6 +68,16 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  // Bulk upserts can stop early under concurrency limits and return partial
+  // failures without throwing. Log any errors so silently incomplete indexes
+  // are caught before the triage agent begins serving queries.
+  if (upsertResponse?.errors?.length) {
+    console.error(
+      '[indexPolicyWording] Upsert completed with partial failures:',
+      upsertResponse.errors,
+    );
+  }
 
   return clauses.length;
 }
