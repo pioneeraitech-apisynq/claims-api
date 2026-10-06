@@ -1,23 +1,54 @@
-import { Pinecone } from '@pinecone-database/pinecone';
+/**
+ * MongoDB Atlas Vector Search client for policy-wording retrieval.
+ *
+ * This module replaces the former Pinecone integration.  Vectors are now
+ * stored in the `policy_wording_clauses` collection of the same Atlas cluster
+ * that holds claim documents, eliminating the external Pinecone dependency and
+ * enabling co-located queries.
+ *
+ * Before this works you must create an Atlas Vector Search index on the
+ * `policy_wording_clauses` collection with the following definition:
+ *
+ *   {
+ *     "fields": [
+ *       {
+ *         "type": "vector",
+ *         "path": "embedding",
+ *         "numDimensions": 1536,
+ *         "similarity": "cosine"
+ *       },
+ *       {
+ *         "type": "filter",
+ *         "path": "productType"
+ *       }
+ *     ]
+ *   }
+ *
+ * Name the index "policy_wording_vector_index" (matches ATLAS_VECTOR_INDEX
+ * below) and create it via the Atlas UI, Atlas CLI, or the Atlas Admin API.
+ */
+
+import mongoose, { Connection } from 'mongoose';
+
+/** Name of the Atlas Vector Search index on the clauses collection. */
+export const ATLAS_VECTOR_INDEX =
+  process.env.ATLAS_VECTOR_INDEX || 'policy_wording_vector_index';
+
+/** Collection that stores policy-wording clause embeddings. */
+export const POLICY_WORDING_COLLECTION =
+  process.env.POLICY_WORDING_COLLECTION || 'policy_wording_clauses';
 
 /**
- * Pinecone holds the vector index of policy wording: every clause of every
- * product wording document, chunked and embedded. The triage agent searches it
- * so its decision can quote the clause it relied on.
+ * Returns the native MongoDB Collection for policy-wording clauses, obtained
+ * from the active Mongoose default connection.  Throws if Mongoose is not yet
+ * connected.
  */
-let pinecone: Pinecone | null = null;
-
-export function getPinecone(): Pinecone {
-  if (!pinecone) {
-    pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+export function getPolicyWordingCollection(conn?: Connection) {
+  const connection = conn ?? mongoose.connection;
+  if (connection.readyState !== 1) {
+    throw new Error(
+      'MongoDB connection is not open; cannot access policy_wording_clauses collection',
+    );
   }
-  return pinecone;
+  return connection.db.collection(POLICY_WORDING_COLLECTION);
 }
-
-export function policyWordingIndex() {
-  const indexName = process.env.PINECONE_INDEX || 'policy-wording';
-  return getPinecone().index(indexName);
-}
-
-export const POLICY_WORDING_NAMESPACE =
-  process.env.PINECONE_NAMESPACE || 'policy-wording-v1';

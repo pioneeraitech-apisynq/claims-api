@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -218,6 +219,13 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The database write that records the settlement is wrapped in a MongoDB ACID
+   * transaction so it can be retried or rolled back independently of the
+   * external payment call.  If the write fails after the payout has been
+   * booked, the transaction is aborted and the caller receives an error; the
+   * payment record in the Payment API remains and can be reconciled by a
+   * separate process using the paymentId returned by createSettlementPayout.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -246,6 +254,10 @@ export class ClaimsService {
       throw new BadRequestException('Settlement amount must be positive');
     }
 
+    // Book the payout through the Payment API BEFORE opening the transaction.
+    // Money movement is owned by the external service; we record the outcome in
+    // MongoDB.  If the DB write fails the payment record is preserved in the
+    // Payment API and can be reconciled via the paymentId.
     const payout = await createSettlementPayout({
       policyId: claim.policyNumber,
       customerId: claim.customerId,
@@ -265,17 +277,30 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Wrap the database write in a MongoDB ACID transaction so the settlement
+    // record and status update are applied atomically.  On replica sets a write
+    // acknowledged inside a committed transaction is never rolled back on
+    // primary failover.
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
