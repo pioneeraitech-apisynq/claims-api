@@ -74,6 +74,77 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/** Status codes that OpenAI uses for rate-limit / overload responses. */
+const RETRYABLE_STATUS_CODES = new Set([429, 503]);
+
+/** Base delay in milliseconds for the first backoff interval (1 s, 2 s, 4 s …). */
+const BACKOFF_BASE_MS = 1_000;
+
+/**
+ * Return the number of milliseconds to wait before the next attempt.
+ *
+ * Prefers the `Retry-After` header value when the provider supplies one
+ * (OpenAI sends it on 429 `slow_down` and 503 `server_is_overloaded`).
+ * Falls back to exponential backoff: attempt 0 → 1 s, 1 → 2 s, 2 → 4 s.
+ */
+function resolveDelayMs(error: unknown, attempt: number): number {
+  if (error && typeof error === 'object') {
+    // The Vercel AI SDK surfaces the raw response headers on APICallError.
+    const headers = (error as Record<string, unknown>)['responseHeaders'];
+    if (headers && typeof headers === 'object') {
+      const retryAfter =
+        (headers as Record<string, string>)['retry-after'] ??
+        (headers as Record<string, string>)['Retry-After'];
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+        if (Number.isFinite(seconds) && seconds > 0) {
+          return seconds * 1_000;
+        }
+      }
+    }
+  }
+  return BACKOFF_BASE_MS * Math.pow(2, attempt);
+}
+
+/** True when the error represents a transient rate-limit or overload response. */
+function isRetryable(error: unknown): boolean {
+  if (error && typeof error === 'object') {
+    const status = (error as Record<string, unknown>)['statusCode'];
+    if (typeof status === 'number') {
+      return RETRYABLE_STATUS_CODES.has(status);
+    }
+  }
+  return false;
+}
+
+/**
+ * Thin wrapper around `generateObject` that adds Retry-After-aware exponential
+ * backoff for rate-limit (429) and overload (503) errors.
+ *
+ * `maxRetries` is set to 0 on the SDK call so that errors surface immediately
+ * to this wrapper rather than being silently retried without any delay.
+ */
+async function generateObjectWithBackoff(
+  params: Parameters<typeof generateObject>[0],
+  maxAttempts: number = 3,
+): Promise<Awaited<ReturnType<typeof generateObject>>> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await generateObject({ ...params, maxRetries: 0 });
+    } catch (err) {
+      lastError = err;
+      const isLastAttempt = attempt === maxAttempts - 1;
+      if (isLastAttempt || !isRetryable(err)) {
+        throw err;
+      }
+      const delayMs = resolveDelayMs(err, attempt);
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,13 +160,12 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
+  const { object } = await generateObjectWithBackoff({
     model: openai(TRIAGE_MODEL),
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
-    maxRetries: 2,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
