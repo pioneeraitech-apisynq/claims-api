@@ -6,18 +6,26 @@ import { EMBEDDING_MODEL, openai } from '../openai.provider';
  * text-embedding-3-small through the same gateway-aware provider as the rest of
  * the OpenAI traffic.
  */
-export async function embedQuery(text: string): Promise<number[]> {
+export async function embedQuery(
+  text: string,
+  abortSignal?: AbortSignal,
+): Promise<number[]> {
   const { embedding } = await embed({
     model: openai.embedding(EMBEDDING_MODEL),
     value: text,
+    abortSignal,
   });
   return embedding;
 }
 
-export async function embedClauses(texts: string[]): Promise<number[][]> {
+export async function embedClauses(
+  texts: string[],
+  abortSignal?: AbortSignal,
+): Promise<number[][]> {
   const { embeddings } = await embedMany({
     model: openai.embedding(EMBEDDING_MODEL),
     values: texts,
+    abortSignal,
   });
   return embeddings;
 }
