@@ -19,6 +19,18 @@ export function getRedis(): Redis {
   return client;
 }
 
+/**
+ * Gracefully closes the shared Redis connection.
+ * Should be called during application shutdown to avoid server-side
+ * `ECONNRESET` errors and release connection resources cleanly.
+ */
+export async function closeRedis(): Promise<void> {
+  if (client) {
+    await client.quit();
+    client = null;
+  }
+}
+
 const LOCK_TTL_SECONDS = 60;
 
 /**

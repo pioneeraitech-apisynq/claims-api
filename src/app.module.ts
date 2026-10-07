@@ -1,7 +1,15 @@
-import { Module } from '@nestjs/common';
+import { Module, Injectable, OnApplicationShutdown } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { ClaimsModule } from './claims/claims.module';
 import { HealthController } from './health/health.controller';
+import { closeRedis } from './cache/redis.client';
+
+@Injectable()
+class RedisShutdownService implements OnApplicationShutdown {
+  async onApplicationShutdown(_signal?: string): Promise<void> {
+    await closeRedis();
+  }
+}
 
 @Module({
   imports: [
@@ -11,5 +19,6 @@ import { HealthController } from './health/health.controller';
     ClaimsModule,
   ],
   controllers: [HealthController],
+  providers: [RedisShutdownService],
 })
 export class AppModule {}
