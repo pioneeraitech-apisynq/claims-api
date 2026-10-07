@@ -1,6 +1,6 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
-import { TRIAGE_MODEL, openai } from '../../openai.provider';
+import { TRIAGE_MODEL, modelSupportsTemperature, openai } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
@@ -89,13 +89,19 @@ export async function runTriageAgent(
     clauses,
   };
 
+  // `temperature` is not supported by all models (e.g. gpt-6-astra rejects it).
+  // Only include it when the selected model is known to accept the parameter.
+  const temperatureParam = modelSupportsTemperature(TRIAGE_MODEL)
+    ? { temperature: 0.1 }
+    : {};
+
   const { object } = await generateObject({
     model: openai(TRIAGE_MODEL),
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
+    ...temperatureParam,
+    maxRetries: 0, // Retry-After / backoff is handled by the provider fetch wrapper.
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
