@@ -65,6 +65,7 @@ export type TriageResult = z.infer<typeof triageResultSchema>;
 export interface TriageAgentInput
   extends Omit<TriagePromptInput, 'clauses' | 'fastTrackThresholdCents'> {
   fastTrackThresholdCents?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface TriageAgentOutput extends TriageResult {
@@ -77,15 +78,19 @@ const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
+  const { abortSignal, ...agentInput } = input;
+
   const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
+    agentInput.incidentNarrative,
+    agentInput.productType,
+    4,
+    abortSignal,
   );
 
   const promptInput: TriagePromptInput = {
-    ...input,
+    ...agentInput,
     fastTrackThresholdCents:
-      input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
+      agentInput.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
     clauses,
   };
 
@@ -96,13 +101,14 @@ export async function runTriageAgent(
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
     maxRetries: 2,
+    abortSignal,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
   const recommendedPayoutCents = Math.min(
     object.recommendedPayoutCents,
-    input.coverageAmountCents,
+    agentInput.coverageAmountCents,
   );
 
   return {
