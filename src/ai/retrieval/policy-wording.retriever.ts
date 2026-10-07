@@ -21,8 +21,9 @@ export async function searchPolicyWording(
   narrative: string,
   productType: string,
   topK = 4,
+  abortSignal?: AbortSignal,
 ): Promise<PolicyClause[]> {
-  const vector = await embedQuery(narrative);
+  const vector = await embedQuery(narrative, abortSignal);
 
   const result = await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
@@ -52,8 +53,12 @@ export async function searchPolicyWording(
 export async function indexPolicyWording(
   productType: string,
   clauses: { clauseId: string; heading: string; text: string }[],
+  abortSignal?: AbortSignal,
 ): Promise<number> {
-  const vectors = await embedClauses(clauses.map((clause) => clause.text));
+  const vectors = await embedClauses(
+    clauses.map((clause) => clause.text),
+    abortSignal,
+  );
 
   await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
