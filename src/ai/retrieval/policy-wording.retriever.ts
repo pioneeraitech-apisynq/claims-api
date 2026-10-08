@@ -55,7 +55,7 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
+  const response = await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
     .upsert(
       clauses.map((clause, index) => ({
@@ -68,6 +68,16 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  // Upsert operations can fail partially. Inspect `response.errors` so a
+  // silent partial write never leaves the policy-wording index incomplete and
+  // causes the triage agent to miss coverage clauses.
+  if (response?.errors && response.errors.length > 0) {
+    throw new Error(
+      `Pinecone upsert reported ${response.errors.length} error(s) for ` +
+        `productType "${productType}": ${JSON.stringify(response.errors)}`,
+    );
+  }
 
   return clauses.length;
 }
