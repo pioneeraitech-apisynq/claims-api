@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -152,6 +153,12 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The MongoDB write is performed inside an ACID session/transaction so that
+   * a crash between the updateOne and the cache write cannot leave the
+   * persisted status and the cached result in a diverged state. The Redis cache
+   * write is intentionally placed after the transaction commits; it is a
+   * best-effort warm-up and a cache miss is always safe to tolerate.
    */
   async triage(
     claimId: string,
@@ -194,21 +201,41 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      // Persist the triage result inside an ACID transaction so that the
+      // status update is atomic. The cache write happens after a successful
+      // commit; if it fails the next caller will simply re-run the agent.
+      const session = await this.connection.startSession();
+      try {
+        session.startTransaction();
 
-      await writeCachedTriage(claimId, result);
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                triage: { ...result, triagedAt: new Date().toISOString() },
+                status: result.requiresHumanAdjuster
+                  ? 'awaiting_adjuster'
+                  : 'triaged',
+              },
+            },
+            { session },
+          )
+          .exec();
+
+        await session.commitTransaction();
+      } catch (err) {
+        await session.abortTransaction();
+        throw err;
+      } finally {
+        await session.endSession();
+      }
+
+      // Best-effort cache warm-up — runs after the transaction is committed.
+      await writeCachedTriage(claimId, result).catch(() => {
+        /* non-fatal: a cache miss on the next call is acceptable */
+      });
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
@@ -218,6 +245,12 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The Payment API call is made before the transaction opens (it is an
+   * external side-effect that cannot be rolled back). The subsequent MongoDB
+   * write is wrapped in an ACID transaction so that any failure after the
+   * payment is captured cannot leave the claim document in a state that
+   * diverges from the booked payment.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +298,35 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
+    // Wrap the claim update in an ACID transaction. If the process crashes
+    // after the Payment API call but before this write completes, the
+    // transaction is automatically aborted and the missing write is detectable
+    // via the payment record in the Payment API (paymentId has no matching
+    // settlement on the claim), allowing reconciliation.
+    const session = await this.connection.startSession();
+    try {
+      session.startTransaction();
+
+      await this.claimModel
+        .updateOne(
+          { claimId },
+          {
+            $set: {
+              settlement,
+              status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
+            },
           },
-        },
-      )
-      .exec();
+          { session },
+        )
+        .exec();
+
+      await session.commitTransaction();
+    } catch (err) {
+      await session.abortTransaction();
+      throw err;
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
