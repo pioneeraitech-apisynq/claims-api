@@ -11,10 +11,10 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK's Responses API with a
+ * zod-constrained result. Before the model is called, the claim narrative is
+ * used to retrieve the relevant policy wording clauses from Pinecone, so the
+ * agent quotes real wording instead of paraphrasing from memory.
  */
 
 export const triageResultSchema = z.object({
@@ -74,6 +74,81 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/** Maximum number of attempts (1 initial + retries). */
+const MAX_ATTEMPTS = 3;
+
+/**
+ * Parse the `Retry-After` response header and return the number of
+ * milliseconds to wait. Accepts both the HTTP-date form and the
+ * delta-seconds form; falls back to `fallbackMs` when absent or unparseable.
+ */
+function parseRetryAfterMs(
+  headers: Record<string, string> | undefined,
+  fallbackMs: number,
+): number {
+  const raw = headers?.['retry-after'] ?? headers?.['Retry-After'];
+  if (!raw) return fallbackMs;
+  const seconds = Number(raw);
+  if (!Number.isNaN(seconds)) return seconds * 1000;
+  const date = Date.parse(raw);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return fallbackMs;
+}
+
+/**
+ * Call `generateObject` against the Responses API with Retry-After-aware
+ * exponential backoff on 429 (rate-limit) and 503 (overloaded) errors.
+ *
+ * Findings addressed:
+ *  - Finding 2: honour `Retry-After` header; fall back to exponential backoff.
+ *  - Finding 3: `temperature` is omitted — gpt-6-astra does not support it.
+ *  - Finding 4: `openai.responses()` routes the call through the Responses API
+ *               instead of Chat Completions, as required for GPT-6 Astra tool /
+ *               schema-constrained calling.
+ */
+async function generateTriageObject(
+  params: Omit<Parameters<typeof generateObject>[0], 'model'>,
+) {
+  let attempt = 0;
+  let baseBackoffMs = 1_000;
+
+  while (true) {
+    attempt += 1;
+    try {
+      return await generateObject({
+        model: openai.responses(TRIAGE_MODEL),
+        ...params,
+      });
+    } catch (err: unknown) {
+      const isRetryable =
+        err instanceof Error &&
+        /429|503|rate.?limit|slow.?down|overload/i.test(err.message);
+
+      if (!isRetryable || attempt >= MAX_ATTEMPTS) throw err;
+
+      // Prefer the Retry-After header when available; otherwise double the
+      // base backoff (capped at 30 s) and add ±20 % jitter.
+      const headers =
+        err instanceof Error &&
+        'responseHeaders' in err &&
+        typeof (err as { responseHeaders?: unknown }).responseHeaders ===
+          'object'
+          ? ((err as { responseHeaders: Record<string, string> })
+              .responseHeaders ?? undefined)
+          : undefined;
+
+      const retryAfterMs = parseRetryAfterMs(headers, baseBackoffMs);
+      const jitter = retryAfterMs * 0.2 * (Math.random() * 2 - 1);
+      const waitMs = Math.max(0, retryAfterMs + jitter);
+
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+      // Grow the base backoff for subsequent fallback calculations.
+      baseBackoffMs = Math.min(baseBackoffMs * 2, 30_000);
+    }
+  }
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,13 +164,13 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+  const { object } = await generateTriageObject({
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
+    // temperature is intentionally omitted: gpt-6-astra does not support it.
+    // maxRetries is set to 0 because generateTriageObject handles retries itself.
+    maxRetries: 0,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
