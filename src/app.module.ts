@@ -7,6 +7,13 @@ import { HealthController } from './health/health.controller';
   imports: [
     MongooseModule.forRoot(
       process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/claims',
+      {
+        tls: true,
+        tlsCAFile: process.env.MONGODB_TLS_CA_FILE,
+        authSource: process.env.MONGODB_AUTH_SOURCE || 'admin',
+        retryWrites: true,
+        w: 'majority',
+      },
     ),
     ClaimsModule,
   ],

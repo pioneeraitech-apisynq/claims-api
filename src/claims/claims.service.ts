@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -152,6 +153,10 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The MongoDB write and the Redis cache update are wrapped in a transaction
+   * so that a failure after the write but before caching does not leave the
+   * claim with an unrecorded triage result.
    */
   async triage(
     claimId: string,
@@ -194,21 +199,30 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      const session = await this.connection.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne(
+              { claimId },
+              {
+                $set: {
+                  triage: { ...result, triagedAt: new Date().toISOString() },
+                  status: result.requiresHumanAdjuster
+                    ? 'awaiting_adjuster'
+                    : 'triaged',
+                },
+              },
+              { session },
+            )
+            .exec();
 
-      await writeCachedTriage(claimId, result);
+          await writeCachedTriage(claimId, result);
+        });
+      } finally {
+        await session.endSession();
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
@@ -218,6 +232,11 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The Payment API call happens before the transaction is opened (it is an
+   * external side-effect and cannot be rolled back by MongoDB). The transaction
+   * therefore only guards the MongoDB write, ensuring the settlement record and
+   * status change land atomically or not at all.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +284,25 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
