@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -20,6 +19,7 @@ import {
 import { putClaimDocument } from '../storage/s3.client';
 import {
   acquireTriageLock,
+  invalidateCachedTriage,
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
@@ -111,6 +111,10 @@ export class ClaimsService {
    * Upload a claim document. The bytes go to S3; the document extraction agent
    * reads the supplied text layer and the extracted fields are stored alongside
    * the object key.
+   *
+   * Adding a document materially changes the claim, so any cached triage result
+   * is invalidated here to prevent a subsequent triage() call from returning a
+   * stale pre-upload result (finding: cache not invalidated on claim mutation).
    */
   async addDocument(claimId: string, dto: UploadDocumentDto) {
     const claim = await this.findOne(claimId);
@@ -142,6 +146,10 @@ export class ClaimsService {
     await this.claimModel
       .updateOne({ claimId }, { $push: { documents: document } })
       .exec();
+
+    // Bust the triage cache so the next triage() call re-runs against the
+    // updated claim rather than returning a pre-document-upload result.
+    await invalidateCachedTriage(claimId);
 
     return document;
   }
