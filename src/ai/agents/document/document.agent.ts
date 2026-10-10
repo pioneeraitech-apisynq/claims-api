@@ -8,18 +8,21 @@ import {
 /**
  * Claim document extraction agent.
  *
- * Runs Anthropic claude-sonnet-4-5 over the text of an uploaded claim document
+ * Runs Anthropic claude-sonnet-5-5 over the text of an uploaded claim document
  * and returns the fields the adjuster and the triage agent need: who issued it,
  * when, what it totals, and whether it carries medical data.
  */
 
-export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-4-5';
+export const DOCUMENT_EXTRACTION_MODEL = 'claude-sonnet-5-5';
 
 let anthropic: Anthropic | null = null;
 
 function getAnthropic(): Anthropic {
   if (!anthropic) {
-    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    anthropic = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      defaultHeaders: { 'anthropic-version': '2026-04-01' },
+    });
   }
   return anthropic;
 }
