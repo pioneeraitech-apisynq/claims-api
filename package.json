@@ -19,7 +19,7 @@
     "@nestjs/core": "^10.0.0",
     "@nestjs/mongoose": "^10.1.0",
     "@nestjs/platform-express": "^10.0.0",
-    "@pinecone-database/pinecone": "^6.1.1",
+    "@pinecone-database/pinecone": "^9.0.0",
     "ai": "^4.3.19",
     "axios": "^1.7.0",
     "class-transformer": "^0.5.1",
