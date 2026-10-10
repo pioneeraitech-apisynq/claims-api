@@ -11,7 +11,7 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
@@ -74,6 +74,122 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Maximum number of attempts (1 initial + up to 3 retries) for transient
+ * OpenAI errors.
+ */
+const MAX_ATTEMPTS = 4;
+
+/**
+ * Base delay (ms) used for exponential back-off when no Retry-After header is
+ * present.  Doubles on every subsequent attempt: 1 s, 2 s, 4 s, …
+ */
+const BASE_BACKOFF_MS = 1_000;
+
+/**
+ * Resolves the number of milliseconds to wait before the next attempt.
+ *
+ * Priority order:
+ *  1. `Retry-After` header value from the response (seconds or HTTP-date).
+ *  2. Exponential back-off based on how many attempts have already been made.
+ *
+ * @param retryAfterHeader - Raw value of the `Retry-After` response header, or
+ *                           null/undefined when absent.
+ * @param attemptsMade     - Number of attempts already completed (≥ 1).
+ */
+function resolveDelayMs(
+  retryAfterHeader: string | null | undefined,
+  attemptsMade: number,
+): number {
+  if (retryAfterHeader) {
+    // Retry-After can be a delta-seconds integer or an HTTP-date string.
+    const deltaSeconds = Number(retryAfterHeader);
+    if (!Number.isNaN(deltaSeconds) && deltaSeconds >= 0) {
+      return Math.ceil(deltaSeconds * 1_000);
+    }
+    const httpDate = Date.parse(retryAfterHeader);
+    if (!Number.isNaN(httpDate)) {
+      const waitMs = httpDate - Date.now();
+      if (waitMs > 0) return waitMs;
+    }
+  }
+  // Fall back to exponential back-off (capped at 30 s).
+  return Math.min(BASE_BACKOFF_MS * 2 ** (attemptsMade - 1), 30_000);
+}
+
+/**
+ * Extracts structured error metadata from an error thrown by the Vercel AI SDK
+ * / OpenAI SDK.  Returns null when the error is not a retryable HTTP error.
+ */
+function extractRetryInfo(err: unknown): {
+  status: number;
+  retryAfter: string | null | undefined;
+} | null {
+  if (err == null || typeof err !== 'object') return null;
+  const e = err as Record<string, unknown>;
+
+  // The AI SDK wraps HTTP errors in an object with a `status` (or `statusCode`)
+  // field and optionally a `responseHeaders` map or a `headers` map.
+  const status =
+    typeof e['status'] === 'number'
+      ? e['status']
+      : typeof e['statusCode'] === 'number'
+        ? e['statusCode']
+        : null;
+
+  if (status !== 429 && status !== 503) return null;
+
+  // Try the most common header carrier shapes exposed by the SDK.
+  const headers =
+    (e['responseHeaders'] as Record<string, string> | undefined) ??
+    (e['headers'] as Record<string, string> | undefined) ??
+    {};
+
+  const retryAfter =
+    headers['retry-after'] ?? headers['Retry-After'] ?? null;
+
+  return { status, retryAfter };
+}
+
+/**
+ * Runs `fn` and retries up to (MAX_ATTEMPTS - 1) times when OpenAI responds
+ * with a 429 (slow_down / rate-limit) or 503 (server_is_overloaded).
+ *
+ * - Respects the `Retry-After` header when present.
+ * - Falls back to exponential back-off otherwise.
+ * - Any other error is rethrown immediately without consuming retry budget.
+ */
+async function withOpenAIRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const retryInfo = extractRetryInfo(err);
+
+      // Non-retryable error — propagate immediately.
+      if (retryInfo === null) throw err;
+
+      const { status, retryAfter } = retryInfo;
+      const errorKind =
+        status === 429 ? 'slow_down (429)' : 'server_is_overloaded (503)';
+
+      if (attempt >= MAX_ATTEMPTS) {
+        // Exhausted all retries — surface the original error.
+        throw err;
+      }
+
+      const delayMs = resolveDelayMs(retryAfter, attempt);
+      console.warn(
+        `OpenAI ${errorKind} on attempt ${attempt}/${MAX_ATTEMPTS}. ` +
+          `Waiting ${delayMs} ms before retry.`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,14 +205,17 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  const { object } = await withOpenAIRetry(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+      // temperature and top_p are not supported by GPT-6 Astra and must be
+      // omitted. See finding #3.
+      maxRetries: 0, // retries are handled by withOpenAIRetry above
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
