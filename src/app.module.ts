@@ -3,11 +3,16 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { ClaimsModule } from './claims/claims.module';
 import { HealthController } from './health/health.controller';
 
+if (!process.env.MONGODB_URI) {
+  throw new Error(
+    'MONGODB_URI environment variable is required. ' +
+      'Set it to a mongodb+srv:// Atlas URI with credentials and TLS enabled.',
+  );
+}
+
 @Module({
   imports: [
-    MongooseModule.forRoot(
-      process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/claims',
-    ),
+    MongooseModule.forRoot(process.env.MONGODB_URI),
     ClaimsModule,
   ],
   controllers: [HealthController],

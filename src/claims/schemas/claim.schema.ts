@@ -133,6 +133,16 @@ export class Claim {
   /**
    * Free-text medical notes supplied on bodily-injury claims. Health data: read
    * by the triage agent, never returned in list responses.
+   *
+   * SECURITY — PHI / field-level encryption required:
+   * This field must be encrypted at rest using MongoDB Atlas Client-Side Field
+   * Level Encryption (CSFLE) / Queryable Encryption with a Customer-Managed Key
+   * (CMK) before this service is deployed to production. Configure the
+   * `MongoClient` (or Mongoose connection) with an `autoEncryption` descriptor
+   * that specifies the `claims.medicalNotes` field and your KMS provider
+   * (e.g. AWS KMS key ARN in `AWS_REGION`). Until CSFLE is wired in, this
+   * field MUST NOT be populated in any environment that can be reached from the
+   * internet. See: https://www.mongodb.com/docs/manual/core/csfle/
    */
   @Prop({ default: null })
   medicalNotes: string | null;

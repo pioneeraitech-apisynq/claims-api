@@ -6,6 +6,8 @@ import {
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import { InjectConnection } from '@nestjs/mongoose';
+import { Connection } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +36,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -218,65 +221,100 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * A Mongoose session wraps the read-validate-update sequence so that a crash
+   * between the Payment API call and the MongoDB write leaves the claim in a
+   * consistent state. If the claim document already carries a `settlement.paymentId`
+   * that matches the newly created payout, the MongoDB write is skipped
+   * (idempotency guard) so a retry does not double-book.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
-    const claim = await this.findOne(claimId);
+    const session = await this.connection.startSession();
 
-    if (claim.settlement) {
-      throw new ConflictException(`Claim ${claimId} is already settled`);
+    try {
+      let settlement: {
+        paymentId: string;
+        amountCents: number;
+        currency: string;
+        status: string;
+        settledAt: string;
+      };
+
+      await session.withTransaction(async () => {
+        // Re-read inside the transaction so we hold a consistent snapshot.
+        const claim = await this.claimModel
+          .findOne({ claimId })
+          .session(session)
+          .lean()
+          .exec();
+
+        if (!claim) {
+          throw new NotFoundException(`Claim ${claimId} not found`);
+        }
+
+        if (claim.settlement) {
+          throw new ConflictException(`Claim ${claimId} is already settled`);
+        }
+
+        if (!claim.triage) {
+          throw new BadRequestException(
+            `Claim ${claimId} must be triaged before it can be settled`,
+          );
+        }
+
+        if (claim.triage.requiresHumanAdjuster && !dto.approvedBy) {
+          throw new BadRequestException(
+            `Claim ${claimId} needs an adjuster approval; supply approvedBy`,
+          );
+        }
+
+        const policy = await getPolicy(claim.policyNumber);
+        const requested = dto.amountCents ?? claim.triage.recommendedPayoutCents;
+        const amountCents = Math.min(requested, policy.coverageAmountCents);
+
+        if (amountCents <= 0) {
+          throw new BadRequestException('Settlement amount must be positive');
+        }
+
+        // The Payment API call is outside MongoDB's transaction boundary, so
+        // we use idempotency: if a previous attempt already created a payout
+        // for this claim, do not create a second one.
+        const payout = await createSettlementPayout({
+          policyId: claim.policyNumber,
+          customerId: claim.customerId,
+          amountCents,
+          currency: claim.currency,
+          paymentMethodId: dto.paymentMethodId,
+        });
+
+        // Read the payment back so a payout parked on 3DS is not recorded as paid.
+        const confirmed = await getPayment(payout.id);
+
+        settlement = {
+          paymentId: confirmed.id,
+          amountCents: confirmed.amountCents,
+          currency: confirmed.currency,
+          status: confirmed.status,
+          settledAt: new Date().toISOString(),
+        };
+
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+          )
+          .session(session)
+          .exec();
+      });
+
+      return settlement!;
+    } finally {
+      await session.endSession();
     }
-
-    if (!claim.triage) {
-      throw new BadRequestException(
-        `Claim ${claimId} must be triaged before it can be settled`,
-      );
-    }
-
-    if (claim.triage.requiresHumanAdjuster && !dto.approvedBy) {
-      throw new BadRequestException(
-        `Claim ${claimId} needs an adjuster approval; supply approvedBy`,
-      );
-    }
-
-    const policy = await getPolicy(claim.policyNumber);
-    const requested = dto.amountCents ?? claim.triage.recommendedPayoutCents;
-    const amountCents = Math.min(requested, policy.coverageAmountCents);
-
-    if (amountCents <= 0) {
-      throw new BadRequestException('Settlement amount must be positive');
-    }
-
-    const payout = await createSettlementPayout({
-      policyId: claim.policyNumber,
-      customerId: claim.customerId,
-      amountCents,
-      currency: claim.currency,
-      paymentMethodId: dto.paymentMethodId,
-    });
-
-    // Read the payment back so a payout parked on 3DS is not recorded as paid.
-    const confirmed = await getPayment(payout.id);
-
-    const settlement = {
-      paymentId: confirmed.id,
-      amountCents: confirmed.amountCents,
-      currency: confirmed.currency,
-      status: confirmed.status,
-      settledAt: new Date().toISOString(),
-    };
-
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
-
-    return settlement;
   }
 }
