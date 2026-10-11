@@ -1,3 +1,4 @@
+import type { LanguageModelMiddleware } from 'ai';
 import { embedClauses, embedQuery } from './embeddings';
 import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client';
 
@@ -43,6 +44,68 @@ export async function searchPolicyWording(
       score: match.score ?? 0,
     };
   });
+}
+
+/**
+ * AI SDK Language Model Middleware that injects relevant policy wording clauses
+ * into the prompt before every model call.
+ *
+ * Usage:
+ *   import { wrapLanguageModel } from 'ai';
+ *   import { createPolicyWordingMiddleware } from '../../retrieval/policy-wording.retriever';
+ *
+ *   const model = wrapLanguageModel({
+ *     model: openai(TRIAGE_MODEL),
+ *     middleware: createPolicyWordingMiddleware(productType),
+ *   });
+ *
+ * The middleware extracts the narrative from the last user message, retrieves
+ * the top matching clauses from Pinecone, and prepends them to the prompt as a
+ * system message so the model always cites real wording.
+ */
+export function createPolicyWordingMiddleware(
+  productType: string,
+  topK = 4,
+): LanguageModelMiddleware {
+  return {
+    middlewareVersion: 'v2',
+    async transformParams({ params }) {
+      // Extract the narrative from the last user message so we can embed it.
+      const messages = params.prompt ?? [];
+      const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+      const narrative =
+        lastUser?.content
+          .filter((part) => part.type === 'text')
+          .map((part) => (part as { type: 'text'; text: string }).text)
+          .join(' ') ?? '';
+
+      if (!narrative) {
+        return { params };
+      }
+
+      const clauses = await searchPolicyWording(narrative, productType, topK);
+
+      if (clauses.length === 0) {
+        return { params };
+      }
+
+      const wordingBlock = clauses
+        .map((clause) => `[${clause.clauseId}] ${clause.heading}\n${clause.text}`)
+        .join('\n\n');
+
+      const ragSystemMessage = {
+        role: 'system' as const,
+        content: `Retrieved policy wording for product "${productType}":\n\n${wordingBlock}`,
+      };
+
+      return {
+        params: {
+          ...params,
+          prompt: [ragSystemMessage, ...messages],
+        },
+      };
+    },
+  };
 }
 
 /**
