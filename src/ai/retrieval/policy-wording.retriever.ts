@@ -1,5 +1,5 @@
 import { embedClauses, embedQuery } from './embeddings';
-import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client';
+import { policyWordingIndex } from './pinecone.client';
 
 /**
  * Retrieval-augmented search over policy wording.
@@ -24,14 +24,14 @@ export async function searchPolicyWording(
 ): Promise<PolicyClause[]> {
   const vector = await embedQuery(narrative);
 
-  const result = await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
-    .query({
-      vector,
-      topK,
-      includeMetadata: true,
-      filter: { productType: { $eq: productType } },
-    });
+  // policyWordingIndex() resolves the active namespace via alias, so reads
+  // automatically follow any alias repoint without a code change.
+  const result = await (await policyWordingIndex()).query({
+    vector,
+    topK,
+    includeMetadata: true,
+    filter: { productType: { $eq: productType } },
+  });
 
   return (result.matches || []).map((match) => {
     const metadata = (match.metadata || {}) as Record<string, unknown>;
@@ -55,19 +55,17 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
-    .upsert(
-      clauses.map((clause, index) => ({
-        id: clause.clauseId,
-        values: vectors[index],
-        metadata: {
-          productType,
-          heading: clause.heading,
-          text: clause.text,
-        },
-      })),
-    );
+  await (await policyWordingIndex()).upsert(
+    clauses.map((clause, index) => ({
+      id: clause.clauseId,
+      values: vectors[index],
+      metadata: {
+        productType,
+        heading: clause.heading,
+        text: clause.text,
+      },
+    })),
+  );
 
   return clauses.length;
 }
