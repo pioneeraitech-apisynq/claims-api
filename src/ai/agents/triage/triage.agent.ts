@@ -1,7 +1,7 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
-import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
+import { createPolicyWordingMiddleware } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
   buildTriagePrompt,
@@ -12,9 +12,10 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. Before the model is called, the Language Model Middleware retrieves
+ * the relevant policy wording clauses from Pinecone and injects them into the
+ * prompt transparently, so the agent quotes real wording instead of
+ * paraphrasing from memory.
  */
 
 export const triageResultSchema = z.object({
@@ -77,8 +78,10 @@ const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
+  // Wrap the base model with the RAG middleware so retrieval is handled
+  // transparently in the middleware lifecycle rather than in agent code.
+  const { model, getRetrievedClauses } = createPolicyWordingMiddleware(
+    openai(TRIAGE_MODEL),
     input.productType,
   );
 
@@ -86,11 +89,11 @@ export async function runTriageAgent(
     ...input,
     fastTrackThresholdCents:
       input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
+    clauses: [], // populated by the middleware before the model sees the prompt
   };
 
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
@@ -109,6 +112,6 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
+    retrievedClauseIds: getRetrievedClauses().map((clause) => clause.clauseId),
   };
 }
