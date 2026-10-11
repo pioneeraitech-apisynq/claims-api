@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -20,6 +19,7 @@ import {
 import { putClaimDocument } from '../storage/s3.client';
 import {
   acquireTriageLock,
+  deleteTriageLock,
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
@@ -159,15 +159,19 @@ export class ClaimsService {
   ): Promise<TriageAgentOutput> {
     const claim = await this.findOne(claimId);
 
-    if (!dto.force) {
+    if (dto.force) {
+      // Eagerly delete the stale cache entry so no outdated result is ever
+      // served if the new model run fails (finding 7).
+      await deleteTriageLock(claimId);
+    } else {
       const cached = await readCachedTriage<TriageAgentOutput>(claimId);
       if (cached) {
         return cached;
       }
     }
 
-    const locked = await acquireTriageLock(claimId);
-    if (!locked) {
+    const token = await acquireTriageLock(claimId);
+    if (!token) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
 
@@ -211,7 +215,7 @@ export class ClaimsService {
       await writeCachedTriage(claimId, result);
       return result;
     } finally {
-      await releaseTriageLock(claimId);
+      await releaseTriageLock(claimId, token);
     }
   }
 
