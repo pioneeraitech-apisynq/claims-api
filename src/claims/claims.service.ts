@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -152,6 +151,11 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The cache read is intentionally placed *inside* the lock so that the
+   * check-then-act sequence is atomic: a second caller that lost the lock race
+   * will find the cache already populated by the winner and return immediately
+   * rather than re-running the model.
    */
   async triage(
     claimId: string,
@@ -159,19 +163,19 @@ export class ClaimsService {
   ): Promise<TriageAgentOutput> {
     const claim = await this.findOne(claimId);
 
-    if (!dto.force) {
-      const cached = await readCachedTriage<TriageAgentOutput>(claimId);
-      if (cached) {
-        return cached;
-      }
-    }
-
     const locked = await acquireTriageLock(claimId);
     if (!locked) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
 
     try {
+      if (!dto.force) {
+        const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+        if (cached) {
+          return cached;
+        }
+      }
+
       const [policy, coverage] = await Promise.all([
         getPolicy(claim.policyNumber),
         getPolicyCoverage(claim.policyNumber),

@@ -12,11 +12,25 @@ let client: Redis | null = null;
 export function getRedis(): Redis {
   if (!client) {
     client = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-      maxRetriesPerRequest: 2,
+      // null = retry until the retryStrategy gives up, absorbing transient
+      // network blips without immediately surfacing them as errors to callers.
+      maxRetriesPerRequest: null,
       lazyConnect: false,
     });
   }
   return client;
+}
+
+/**
+ * Gracefully close the shared connection. Call this during application
+ * shutdown so the Redis server releases the connection slot immediately
+ * rather than waiting for the TCP timeout to expire.
+ */
+export async function closeRedis(): Promise<void> {
+  if (client) {
+    await client.quit();
+    client = null;
+  }
 }
 
 const LOCK_TTL_SECONDS = 60;
