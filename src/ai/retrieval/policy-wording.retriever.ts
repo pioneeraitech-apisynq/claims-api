@@ -1,12 +1,18 @@
-import { embedClauses, embedQuery } from './embeddings';
-import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client';
+import {
+  POLICY_WORDING_NAMESPACE,
+  policyWordingDocumentIndex,
+} from './pinecone.client';
 
 /**
  * Retrieval-augmented search over policy wording.
  *
- * The claim narrative is embedded and matched against the clause index in
- * Pinecone. The top clauses are handed to the triage agent so its decision
- * cites the wording it relied on rather than inventing one.
+ * Uses the Pinecone Documents API against a schema-based index so that each
+ * search is a hybrid BM25 + dense query (GA on API version 2026-07). This
+ * matters for policy wording because exact matches on clause headings and legal
+ * terminology carry real signal that pure cosine similarity cannot capture.
+ *
+ * The server generates all embeddings from the document `text` field, so no
+ * client-side embedding step is needed at search time.
  */
 
 export interface PolicyClause {
@@ -22,25 +28,22 @@ export async function searchPolicyWording(
   productType: string,
   topK = 4,
 ): Promise<PolicyClause[]> {
-  const vector = await embedQuery(narrative);
-
-  const result = await policyWordingIndex()
+  const result = await policyWordingDocumentIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
-    .query({
-      vector,
+    .documents.search({
+      inputs: { text: narrative },
       topK,
-      includeMetadata: true,
       filter: { productType: { $eq: productType } },
     });
 
-  return (result.matches || []).map((match) => {
-    const metadata = (match.metadata || {}) as Record<string, unknown>;
+  return (result.result?.hits || []).map((hit) => {
+    const fields = (hit.fields || {}) as Record<string, unknown>;
     return {
-      clauseId: match.id,
-      productType: String(metadata.productType || productType),
-      heading: String(metadata.heading || ''),
-      text: String(metadata.text || ''),
-      score: match.score ?? 0,
+      clauseId: hit._id,
+      productType: String(fields.productType || productType),
+      heading: String(fields.heading || ''),
+      text: String(fields.text || ''),
+      score: hit._score ?? 0,
     };
   });
 }
@@ -48,24 +51,22 @@ export async function searchPolicyWording(
 /**
  * Index (or re-index) the clauses of a product wording document. Run when a
  * wording is published or amended.
+ *
+ * Documents are upserted via the Documents API; the server derives the dense
+ * vector and BM25 index entries from the `text` field automatically.
  */
 export async function indexPolicyWording(
   productType: string,
   clauses: { clauseId: string; heading: string; text: string }[],
 ): Promise<number> {
-  const vectors = await embedClauses(clauses.map((clause) => clause.text));
-
-  await policyWordingIndex()
+  await policyWordingDocumentIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
-    .upsert(
-      clauses.map((clause, index) => ({
-        id: clause.clauseId,
-        values: vectors[index],
-        metadata: {
-          productType,
-          heading: clause.heading,
-          text: clause.text,
-        },
+    .documents.upsert(
+      clauses.map((clause) => ({
+        _id: clause.clauseId,
+        text: clause.text,
+        productType,
+        heading: clause.heading,
       })),
     );
 
