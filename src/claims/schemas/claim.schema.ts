@@ -159,3 +159,13 @@ export class Claim {
 export type ClaimDocument = HydratedDocument<Claim>;
 
 export const ClaimSchema = SchemaFactory.createForClass(Claim);
+
+/**
+ * Compound index supporting the list() query pattern:
+ *   .find({ policyNumber }).sort({ createdAt: -1 })
+ *
+ * The policyNumber prefix satisfies the optional equality filter; the
+ * createdAt suffix provides a pre-sorted order so MongoDB never needs a
+ * blocking in-memory sort or a full collection scan to resolve the query.
+ */
+ClaimSchema.index({ policyNumber: 1, createdAt: -1 });
