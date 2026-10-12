@@ -1,7 +1,7 @@
-import { generateObject } from 'ai';
+import { generateObject, wrapLanguageModel } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
-import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
+import { createPolicyWordingMiddleware } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
   buildTriagePrompt,
@@ -12,9 +12,9 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. The policy-wording RAG step is handled by Language Model Middleware
+ * wrapping the model, so this call site has no direct Pinecone dependency and
+ * the retrieval concern is reusable across agents.
  */
 
 export const triageResultSchema = z.object({
@@ -77,26 +77,36 @@ const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
-  );
-
+  // RAG is handled transparently by the middleware; the prompt is built without
+  // pre-fetched clauses and the middleware injects the retrieved wording before
+  // the first token is sent to the model.
   const promptInput: TriagePromptInput = {
     ...input,
     fastTrackThresholdCents:
       input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
+    clauses: [],
   };
 
-  const { object } = await generateObject({
+  const model = wrapLanguageModel({
     model: openai(TRIAGE_MODEL),
+    middleware: createPolicyWordingMiddleware(input.productType),
+  });
+
+  const { object, providerMetadata } = await generateObject({
+    model,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
     maxRetries: 2,
   });
+
+  const retrievedClauseIds =
+    (
+      providerMetadata?.policyWordingRetrieval as
+        | { retrievedClauseIds?: string[] }
+        | undefined
+    )?.retrievedClauseIds ?? [];
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
@@ -109,6 +119,6 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
+    retrievedClauseIds,
   };
 }
