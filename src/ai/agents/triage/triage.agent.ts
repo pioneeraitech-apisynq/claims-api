@@ -1,4 +1,5 @@
-import { generateObject } from 'ai';
+import { generateObject, wrapLanguageModel } from 'ai';
+import type { LanguageModelV1Middleware } from 'ai';
 import { z } from 'zod';
 import { TRIAGE_MODEL, openai } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
@@ -12,9 +13,9 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. The policy-wording retrieval is encapsulated in a Language Model
+ * Middleware layer so the RAG concern is transparent to this orchestration
+ * code, reusable across agents, and independently testable/swappable.
  */
 
 export const triageResultSchema = z.object({
@@ -74,23 +75,92 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Language Model Middleware that performs policy-wording RAG before the model
+ * sees the prompt. The retrieved clauses are injected into the last user
+ * message so the agent can quote the wording it relied on. This keeps
+ * retrieval concerns out of the orchestration code and makes the step easy to
+ * swap or test independently.
+ */
+function createPolicyWordingMiddleware(
+  productType: string,
+  onClauses: (clauseIds: string[]) => void,
+): LanguageModelV1Middleware {
+  return {
+    middlewareVersion: 'v2',
+    async transformParams({ params }) {
+      const clauses = await searchPolicyWording(
+        // Extract the narrative from the last user message for the vector query.
+        (() => {
+          const messages = params.prompt;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (msg.role === 'user') {
+              const textPart = msg.content.find((p) => p.type === 'text');
+              if (textPart && textPart.type === 'text') return textPart.text;
+            }
+          }
+          return '';
+        })(),
+        productType,
+      );
+
+      onClauses(clauses.map((c) => c.clauseId));
+
+      if (clauses.length === 0) {
+        return params;
+      }
+
+      // Append retrieved wording as a system message so it is clearly
+      // separated from the policyholder-supplied content.
+      const wordingBlock = clauses
+        .map((clause) => `[${clause.clauseId}] ${clause.heading}\n${clause.text}`)
+        .join('\n\n');
+
+      return {
+        ...params,
+        prompt: [
+          ...params.prompt,
+          {
+            role: 'user' as const,
+            content: [
+              {
+                type: 'text' as const,
+                text: `Retrieved policy wording:\n${wordingBlock}`,
+              },
+            ],
+          },
+        ],
+      };
+    },
+  };
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
-  );
+  const retrievedClauseIds: string[] = [];
 
   const promptInput: TriagePromptInput = {
     ...input,
     fastTrackThresholdCents:
       input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
+    // Clauses are injected by the middleware; pass an empty array as the
+    // placeholder so buildTriagePrompt omits the wording section from the
+    // base prompt (the middleware appends it instead).
+    clauses: [],
   };
 
-  const { object } = await generateObject({
+  const modelWithRag = wrapLanguageModel({
     model: openai(TRIAGE_MODEL),
+    middleware: createPolicyWordingMiddleware(
+      input.productType,
+      (ids) => retrievedClauseIds.push(...ids),
+    ),
+  });
+
+  const { object } = await generateObject({
+    model: modelWithRag,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
@@ -109,6 +179,6 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
+    retrievedClauseIds,
   };
 }
