@@ -11,7 +11,7 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
@@ -74,6 +74,68 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Maximum number of attempts (1 initial + N-1 retries) for a triage completion
+ * call. Retries are only made on 429 / 503 responses.
+ */
+const MAX_ATTEMPTS = 3;
+
+/**
+ * Calls `fn` and retries on 429 / 503 errors using the `Retry-After` response
+ * header when present, falling back to full-jitter exponential backoff.
+ *
+ * Status codes that warrant a retry (slow_down / server_is_overloaded) are
+ * transient by nature; flat-immediate retries worsen rate-limit pressure, so
+ * we always wait before each successive attempt.
+ */
+async function withRetryAfterBackoff<T>(fn: () => Promise<T>): Promise<T> {
+  const RETRYABLE_STATUSES = new Set([429, 503]);
+  const BASE_DELAY_MS = 1_000;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const isLastAttempt = attempt === MAX_ATTEMPTS - 1;
+      if (isLastAttempt) throw err;
+
+      // Extract the HTTP status and Retry-After header from whatever shape the
+      // Vercel AI SDK / fetch surfaces the error in.
+      const status: number | undefined =
+        (err as { status?: number })?.status ??
+        (err as { statusCode?: number })?.statusCode;
+
+      if (status === undefined || !RETRYABLE_STATUSES.has(status)) {
+        throw err;
+      }
+
+      const retryAfterRaw: string | undefined =
+        (err as { responseHeaders?: Record<string, string> })?.responseHeaders?.[
+          'retry-after'
+        ] ??
+        (err as { headers?: Record<string, string> })?.headers?.['retry-after'];
+
+      let delayMs: number;
+      if (retryAfterRaw !== undefined) {
+        // The header value is either a delay-in-seconds integer or an HTTP-date.
+        const seconds = Number(retryAfterRaw);
+        delayMs = Number.isFinite(seconds)
+          ? seconds * 1_000
+          : Math.max(0, new Date(retryAfterRaw).getTime() - Date.now());
+      } else {
+        // Full-jitter exponential backoff: random value in [0, base * 2^attempt).
+        const cap = BASE_DELAY_MS * Math.pow(2, attempt);
+        delayMs = Math.random() * cap;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  // Unreachable — TypeScript needs the explicit throw.
+  throw new Error('withRetryAfterBackoff: exceeded max attempts');
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,14 +151,14 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  const { object } = await withRetryAfterBackoff(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
