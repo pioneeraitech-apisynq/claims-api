@@ -19,5 +19,20 @@ export function policyWordingIndex() {
   return getPinecone().index(indexName);
 }
 
-export const POLICY_WORDING_NAMESPACE =
-  process.env.PINECONE_NAMESPACE || 'policy-wording-v1';
+/**
+ * Returns the namespace object for policy wording reads and writes.
+ *
+ * The value of PINECONE_NAMESPACE_ALIAS is a **namespace alias** — a stable
+ * pointer managed in the Pinecone control plane. To perform a zero-downtime
+ * blue/green data swap:
+ *   1. Populate a new physical namespace (e.g. `policy-wording-v2`).
+ *   2. Call the Pinecone Aliases API to atomically repoint the alias to the
+ *      new namespace.
+ * No code change or service restart is required; both reads and writes here
+ * will automatically follow the alias.
+ */
+export function policyWordingNamespace() {
+  const alias =
+    process.env.PINECONE_NAMESPACE_ALIAS || 'policy-wording-current';
+  return policyWordingIndex().namespace(alias);
+}
