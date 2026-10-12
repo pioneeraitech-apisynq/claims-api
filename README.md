@@ -92,9 +92,11 @@ match the controller routes exactly.
 | `OPENAI_API_KEY` | — | Key for triage and embeddings |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Point at the APISynQ gateway to route OpenAI traffic through it |
 | `ANTHROPIC_API_KEY` | — | Key for document extraction |
-| `PINECONE_API_KEY` | — | Key for the policy wording index |
-| `PINECONE_INDEX` | `policy-wording` | Pinecone index name |
-| `PINECONE_NAMESPACE` | `policy-wording-v1` | Pinecone namespace |
+| `PINECONE_API_KEY` | — | Production Pinecone project API key |
+| `PINECONE_API_KEY_DEV` | — | Dev/test Pinecone project API key — **must be a separate project** to prevent test vectors from contaminating the production index (Pinecone Local is EOL 2026-10-07) |
+| `PINECONE_INDEX` | `policy-wording` | Pinecone index name (production) |
+| `PINECONE_INDEX_DEV` | `policy-wording-dev` | Pinecone index name (dev/test) |
+| `PINECONE_NAMESPACE_ALIAS` | `policy-wording-current` | Namespace alias — repoint via the Pinecone Aliases API for zero-downtime blue/green data swaps |
 
 Copy `.env.example` to `.env` and fill in real keys. The committed `.env` holds
 placeholders only.
