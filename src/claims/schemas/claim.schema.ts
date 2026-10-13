@@ -98,6 +98,10 @@ export class ClaimSettlement {
   settledAt: string;
 }
 
+export const ClaimTriageSchema = SchemaFactory.createForClass(ClaimTriage);
+export const ClaimSettlementSchema =
+  SchemaFactory.createForClass(ClaimSettlement);
+
 @Schema({ collection: 'claims', timestamps: true })
 export class Claim {
   @Prop({ required: true, unique: true, index: true })
@@ -133,8 +137,21 @@ export class Claim {
   /**
    * Free-text medical notes supplied on bodily-injury claims. Health data: read
    * by the triage agent, never returned in list responses.
+   *
+   * CSFLE: encrypted at the field level using MongoDB Client-Side Field Level
+   * Encryption. The data encryption key UUID must be supplied via the
+   * MONGODB_MEDICAL_NOTES_KEY_ID environment variable and the MongoClient must
+   * be configured with `autoEncryption` options pointing to the KMS provider.
+   * Algorithm: AEAD_AES_256_CBC_HMAC_SHA_512-Random (supports null values).
    */
-  @Prop({ default: null })
+  @Prop({
+    default: null,
+    encrypt: {
+      keyId: [{ $uuid: process.env.MONGODB_MEDICAL_NOTES_KEY_ID ?? '' }],
+      bsonType: 'string',
+      algorithm: 'AEAD_AES_256_CBC_HMAC_SHA_512-Random',
+    },
+  })
   medicalNotes: string | null;
 
   @Prop({ required: true })
@@ -149,10 +166,12 @@ export class Claim {
   @Prop({ type: [Object], default: [] })
   documents: ClaimDocumentFile[];
 
-  @Prop({ type: Object, default: null })
+  /** Typed subdocument — Mongoose validates structure on every write. */
+  @Prop({ type: ClaimTriageSchema, default: null })
   triage: ClaimTriage | null;
 
-  @Prop({ type: Object, default: null })
+  /** Typed subdocument — Mongoose validates structure on every write. */
+  @Prop({ type: ClaimSettlementSchema, default: null })
   settlement: ClaimSettlement | null;
 }
 
