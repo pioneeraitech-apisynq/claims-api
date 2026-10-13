@@ -1,12 +1,14 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
+import Redis from 'ioredis';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
 import { SettleClaimDto } from './dto/settle-claim.dto';
@@ -23,6 +25,7 @@ import {
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
+  REDIS_CLIENT,
 } from '../cache/redis.client';
 import {
   runTriageAgent,
@@ -30,10 +33,17 @@ import {
 } from '../ai/agents/triage/triage.agent';
 import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent';
 
+/** Sentinel written to the cache when triage fails, so subsequent callers
+ *  within the TTL receive a fast rejection rather than triggering another
+ *  model invocation. Short TTL lets the operator retry after ~30 s. */
+const TRIAGE_ERROR_SENTINEL = '__triage_error__';
+const TRIAGE_ERROR_TTL_SECONDS = 30;
+
 @Injectable()
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {}
 
   /**
@@ -152,6 +162,11 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * If the agent (or any downstream call) throws, a short-lived error sentinel
+   * is written to the cache so repeated callers cannot trigger runaway model
+   * invocations during a persistent failure — callers must wait for the sentinel
+   * TTL to expire before the lock can be re-acquired.
    */
   async triage(
     claimId: string,
@@ -160,13 +175,21 @@ export class ClaimsService {
     const claim = await this.findOne(claimId);
 
     if (!dto.force) {
-      const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      const cached = await readCachedTriage<TriageAgentOutput | string>(
+        this.redis,
+        claimId,
+      );
       if (cached) {
-        return cached;
+        if (cached === TRIAGE_ERROR_SENTINEL) {
+          throw new ConflictException(
+            `Triage for claim ${claimId} failed recently; please retry shortly`,
+          );
+        }
+        return cached as TriageAgentOutput;
       }
     }
 
-    const locked = await acquireTriageLock(claimId);
+    const locked = await acquireTriageLock(this.redis, claimId);
     if (!locked) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
@@ -208,10 +231,22 @@ export class ClaimsService {
         )
         .exec();
 
-      await writeCachedTriage(claimId, result);
+      await writeCachedTriage(this.redis, claimId, result);
       return result;
+    } catch (err) {
+      // Write a short-lived error sentinel so the next caller within the window
+      // gets an immediate rejection rather than re-entering the model.
+      await writeCachedTriage(
+        this.redis,
+        claimId,
+        TRIAGE_ERROR_SENTINEL,
+        TRIAGE_ERROR_TTL_SECONDS,
+      ).catch(() => {
+        // Best-effort: if Redis is down we still want to surface the original error.
+      });
+      throw err;
     } finally {
-      await releaseTriageLock(claimId);
+      await releaseTriageLock(this.redis, claimId);
     }
   }
 
