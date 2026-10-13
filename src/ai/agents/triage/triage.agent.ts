@@ -1,7 +1,6 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
-import { TRIAGE_MODEL, openai } from '../../openai.provider';
-import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
+import { TRIAGE_MODEL, createTriageModel } from '../../openai.provider';
 import {
   TRIAGE_SYSTEM_PROMPT,
   buildTriagePrompt,
@@ -12,9 +11,9 @@ import {
  * Claim triage agent.
  *
  * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * result. Policy wording retrieval (RAG) is handled transparently by the
+ * Language Model Middleware applied inside `createTriageModel`, keeping this
+ * function free of retrieval concerns.
  */
 
 export const triageResultSchema = z.object({
@@ -69,7 +68,6 @@ export interface TriageAgentInput
 
 export interface TriageAgentOutput extends TriageResult {
   model: string;
-  retrievedClauseIds: string[];
 }
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
@@ -77,20 +75,20 @@ const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
-  const clauses = await searchPolicyWording(
-    input.incidentNarrative,
-    input.productType,
-  );
+  // Policy wording retrieval and prompt augmentation are handled by the RAG
+  // middleware baked into the model returned by createTriageModel — no manual
+  // searchPolicyWording call is needed here.
+  const model = createTriageModel(input.incidentNarrative, input.productType);
 
   const promptInput: TriagePromptInput = {
     ...input,
     fastTrackThresholdCents:
       input.fastTrackThresholdCents ?? DEFAULT_FAST_TRACK_THRESHOLD_CENTS,
-    clauses,
+    clauses: [],
   };
 
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model,
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
@@ -109,6 +107,5 @@ export async function runTriageAgent(
     ...object,
     recommendedPayoutCents,
     model: TRIAGE_MODEL,
-    retrievedClauseIds: clauses.map((clause) => clause.clauseId),
   };
 }
