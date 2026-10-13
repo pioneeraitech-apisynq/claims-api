@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -152,6 +153,9 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The DB write and the cache write are performed inside a MongoDB ACID
+   * session so the persisted triage state is always consistent.
    */
   async triage(
     claimId: string,
@@ -194,21 +198,26 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      const triageUpdate = {
+        triage: { ...result, triagedAt: new Date().toISOString() },
+        status: result.requiresHumanAdjuster ? 'awaiting_adjuster' : 'triaged',
+      };
 
-      await writeCachedTriage(claimId, result);
+      // Wrap the DB write and the cache write in an ACID session so neither
+      // can be left half-applied if the process crashes between the two steps.
+      const session = await this.connection.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne({ claimId }, { $set: triageUpdate }, { session })
+            .exec();
+
+          await writeCachedTriage(claimId, result);
+        });
+      } finally {
+        await session.endSession();
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
@@ -218,6 +227,10 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * All external API calls are made before the MongoDB session is opened so
+   * that the session only covers the atomic DB write. An idempotency re-check
+   * inside the transaction guards against concurrent settlement races.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -246,6 +259,9 @@ export class ClaimsService {
       throw new BadRequestException('Settlement amount must be positive');
     }
 
+    // External Payment API calls are made outside the transaction: they cannot
+    // be rolled back by MongoDB, so we complete them first and only open the
+    // session once we have a confirmed payment object to persist.
     const payout = await createSettlementPayout({
       policyId: claim.policyNumber,
       customerId: claim.customerId,
@@ -265,17 +281,33 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Persist the settlement atomically. The filter includes `settlement: null`
+    // so a concurrent caller that already committed will cause a no-op rather
+    // than an overwrite, and we detect it with the modifiedCount check.
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const result = await this.claimModel
+          .updateOne(
+            { claimId, settlement: null },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+
+        if (result.modifiedCount === 0) {
+          throw new ConflictException(`Claim ${claimId} is already settled`);
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
