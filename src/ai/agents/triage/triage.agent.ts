@@ -11,10 +11,11 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * Runs OpenAI GPT-6 Astra through the Vercel AI SDK using the Responses API
+ * (required for tool/structured-output calls on GPT-6 Astra). Before the model
+ * is called, the claim narrative is used to retrieve the relevant policy wording
+ * clauses from Pinecone, so the agent quotes real wording instead of
+ * paraphrasing from memory.
  */
 
 export const triageResultSchema = z.object({
@@ -74,6 +75,50 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Retry wrapper that honours the `Retry-After` header on 429 / 503 responses
+ * from the OpenAI API and falls back to exponential backoff when the header is
+ * absent.  This replaces the SDK's built-in `maxRetries` option, which retries
+ * immediately without inspecting `Retry-After`.
+ */
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 1_000;
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      attempt += 1;
+      if (attempt > MAX_RETRIES) throw err;
+
+      // The Vercel AI SDK surfaces response headers on API errors.
+      const headers: Record<string, string> =
+        (err as { responseHeaders?: Record<string, string> })
+          ?.responseHeaders ?? {};
+      const retryAfterRaw = headers['retry-after'] ?? headers['Retry-After'];
+      let delayMs: number;
+
+      if (retryAfterRaw) {
+        // Retry-After is either a delta-seconds integer or an HTTP-date.
+        const deltaSeconds = Number(retryAfterRaw);
+        if (!Number.isNaN(deltaSeconds) && deltaSeconds >= 0) {
+          delayMs = deltaSeconds * 1_000;
+        } else {
+          const retryDate = new Date(retryAfterRaw).getTime();
+          delayMs = Math.max(0, retryDate - Date.now());
+        }
+      } else {
+        // Exponential backoff: 1 s, 2 s, 4 s, …
+        delayMs = BASE_BACKOFF_MS * Math.pow(2, attempt - 1);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,14 +134,16 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  // GPT-6 Astra requires the Responses API for structured-output / tool calls.
+  // temperature and top_p are not supported by GPT-6 Astra and are omitted.
+  const { object } = await withRetry(() =>
+    generateObject({
+      model: openai.responses(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
