@@ -1,11 +1,15 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, Inject } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import { Connection } from 'mongoose';
-import { getRedis } from '../cache/redis.client';
+import Redis from 'ioredis';
+import { REDIS_CLIENT } from '../cache/redis.client';
 
 @Controller('health')
 export class HealthController {
-  constructor(@InjectConnection() private readonly connection: Connection) {}
+  constructor(
+    @InjectConnection() private readonly connection: Connection,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+  ) {}
 
   /**
    * GET /health
@@ -19,7 +23,7 @@ export class HealthController {
 
     let redis = 'down';
     try {
-      const pong = await getRedis().ping();
+      const pong = await this.redis.ping();
       redis = pong === 'PONG' ? 'up' : 'down';
     } catch {
       redis = 'down';
