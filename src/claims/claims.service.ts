@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel, InjectConnection } from '@nestjs/mongoose';
+import { Model, Connection } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -30,10 +30,14 @@ import {
 } from '../ai/agents/triage/triage.agent';
 import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent';
 
+/** Projection that strips the PHI medical sub-document from query results. */
+const NO_MEDICAL = { medical: 0 } as const;
+
 @Injectable()
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -73,7 +77,7 @@ export class ClaimsService {
       dateOfLoss: dto.dateOfLoss,
       lossType: dto.lossType,
       incidentNarrative: dto.incidentNarrative,
-      medicalNotes: dto.medicalNotes ?? null,
+      medical: dto.medicalNotes != null ? { notes: dto.medicalNotes } : null,
       claimedAmountCents: dto.claimedAmountCents,
       currency: dto.currency ?? 'usd',
       status: 'filed',
@@ -85,6 +89,10 @@ export class ClaimsService {
     return claim.toObject();
   }
 
+  /**
+   * Internal helper: fetch a claim by id including its PHI sub-document (used
+   * only by service methods that genuinely need health data, e.g. triage).
+   */
   async findOne(claimId: string): Promise<Claim> {
     const claim = await this.claimModel.findOne({ claimId }).lean().exec();
     if (!claim) {
@@ -94,13 +102,14 @@ export class ClaimsService {
   }
 
   /**
-   * List claims, optionally narrowed to one policy. Medical notes are projected
-   * out: health data is never returned in a list response.
+   * List claims, optionally narrowed to one policy. The PHI medical
+   * sub-document is projected out: health data is never returned in a list
+   * response.
    */
   async list(policyNumber?: string): Promise<Claim[]> {
     const filter = policyNumber ? { policyNumber } : {};
     return this.claimModel
-      .find(filter, { medicalNotes: 0 })
+      .find(filter, NO_MEDICAL)
       .sort({ createdAt: -1 })
       .limit(100)
       .lean()
@@ -152,6 +161,10 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The updateOne that persists the triage result runs inside a ClientSession
+   * so that a crash between the agent call and the write does not leave the
+   * claim permanently unlockable or in an indeterminate state.
    */
   async triage(
     claimId: string,
@@ -187,26 +200,37 @@ export class ClaimsService {
         dateOfLoss: claim.dateOfLoss,
         lossType: claim.lossType,
         incidentNarrative: claim.incidentNarrative,
-        medicalNotes: claim.medicalNotes ?? undefined,
+        medicalNotes: claim.medical?.notes ?? undefined,
         claimedAmountCents: claim.claimedAmountCents,
         coverageAmountCents: policy.coverageAmountCents,
         currency: coverage.currency,
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      // Persist the triage result inside a transaction so that a crash between
+      // the agent call and the database write never leaves the claim in an
+      // ambiguous state (finding 2 — ACID transactions for multi-step writes).
+      const session = await this.connection.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne(
+              { claimId },
+              {
+                $set: {
+                  triage: { ...result, triagedAt: new Date().toISOString() },
+                  status: result.requiresHumanAdjuster
+                    ? 'awaiting_adjuster'
+                    : 'triaged',
+                },
+              },
+              { session },
+            )
+            .exec();
+        });
+      } finally {
+        await session.endSession();
+      }
 
       await writeCachedTriage(claimId, result);
       return result;
@@ -218,6 +242,12 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The Payment API call happens before the transaction opens (it is not
+   * idempotent within the session), but the confirmation read and the
+   * database write are committed atomically so a crash after `getPayment()`
+   * but before `updateOne()` cannot leave the claim without a settlement
+   * record while money has already moved.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +295,30 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Commit the settlement record atomically (finding 2 — ACID transactions).
+    // If the write fails, the claim stays in its pre-settlement state and the
+    // caller can retry; the Payment API payout id is preserved in `settlement`
+    // above for reconciliation.
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }

@@ -3,11 +3,18 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { ClaimsModule } from './claims/claims.module';
 import { HealthController } from './health/health.controller';
 
+const mongoUri = process.env.MONGODB_URI;
+if (!mongoUri) {
+  throw new Error(
+    'MONGODB_URI environment variable is not set. ' +
+      'Provide a mongodb+srv:// URI (or a mongodb:// URI with tls=true) ' +
+      'so that traffic to MongoDB is encrypted in transit.',
+  );
+}
+
 @Module({
   imports: [
-    MongooseModule.forRoot(
-      process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/claims',
-    ),
+    MongooseModule.forRoot(mongoUri),
     ClaimsModule,
   ],
   controllers: [HealthController],

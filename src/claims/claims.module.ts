@@ -10,5 +10,6 @@ import { Claim, ClaimSchema } from './schemas/claim.schema';
   ],
   controllers: [ClaimsController],
   providers: [ClaimsService],
+  exports: [MongooseModule],
 })
 export class ClaimsModule {}

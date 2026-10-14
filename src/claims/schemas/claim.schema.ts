@@ -98,6 +98,22 @@ export class ClaimSettlement {
   settledAt: string;
 }
 
+/**
+ * PHI sub-document. Keeping health data in a dedicated nested object lets a
+ * single projection (`{ medical: 0 }`) or field-level encryption policy cover
+ * all health fields uniformly — and makes the exclusion consistent across every
+ * query path (list, findOne, MCP lookup).
+ */
+@Schema({ _id: false })
+export class ClaimMedical {
+  /**
+   * Free-text medical notes supplied on bodily-injury claims. Health data: read
+   * by the triage agent, never returned in non-clinical responses.
+   */
+  @Prop({ default: null })
+  notes: string | null;
+}
+
 @Schema({ collection: 'claims', timestamps: true })
 export class Claim {
   @Prop({ required: true, unique: true, index: true })
@@ -130,12 +146,9 @@ export class Claim {
   @Prop({ required: true })
   incidentNarrative: string;
 
-  /**
-   * Free-text medical notes supplied on bodily-injury claims. Health data: read
-   * by the triage agent, never returned in list responses.
-   */
-  @Prop({ default: null })
-  medicalNotes: string | null;
+  /** PHI sub-document — exclude this field entirely in non-clinical projections. */
+  @Prop({ type: Object, default: null })
+  medical: ClaimMedical | null;
 
   @Prop({ required: true })
   claimedAmountCents: number;
