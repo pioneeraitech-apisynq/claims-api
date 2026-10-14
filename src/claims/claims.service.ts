@@ -2,10 +2,10 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -32,6 +32,8 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 
 @Injectable()
 export class ClaimsService {
+  private readonly logger = new Logger(ClaimsService.name);
+
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
   ) {}
@@ -152,6 +154,11 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * Redis errors on the cache read/write paths are caught and logged rather
+   * than propagated: a cache miss is always safe to recover from by running
+   * the model again, and a failed cache write does not affect the authoritative
+   * result already persisted to MongoDB.
    */
   async triage(
     claimId: string,
@@ -160,7 +167,14 @@ export class ClaimsService {
     const claim = await this.findOne(claimId);
 
     if (!dto.force) {
-      const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      let cached: TriageAgentOutput | null = null;
+      try {
+        cached = await readCachedTriage<TriageAgentOutput>(claimId);
+      } catch (err) {
+        this.logger.warn(
+          `Redis cache read failed for claim ${claimId}; proceeding without cache: ${(err as Error).message}`,
+        );
+      }
       if (cached) {
         return cached;
       }
@@ -208,7 +222,16 @@ export class ClaimsService {
         )
         .exec();
 
-      await writeCachedTriage(claimId, result);
+      // Cache the result. A Redis error here must not surface as a 500 because
+      // the triage has already completed and the MongoDB record is up-to-date.
+      try {
+        await writeCachedTriage(claimId, result);
+      } catch (err) {
+        this.logger.warn(
+          `Redis cache write failed for claim ${claimId}; result was persisted to MongoDB: ${(err as Error).message}`,
+        );
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
