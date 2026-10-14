@@ -19,6 +19,17 @@ export function getRedis(): Redis {
   return client;
 }
 
+/**
+ * Gracefully drain pending commands and close the connection.
+ * Call this inside an onApplicationShutdown / SIGTERM handler.
+ */
+export async function disconnectRedis(): Promise<void> {
+  if (client) {
+    await client.quit();
+    client = null;
+  }
+}
+
 const LOCK_TTL_SECONDS = 60;
 
 /**
@@ -39,20 +50,35 @@ export async function releaseTriageLock(claimId: string): Promise<void> {
   await getRedis().del(`claims:triage:lock:${claimId}`);
 }
 
-export async function readCachedTriage<T>(claimId: string): Promise<T | null> {
-  const raw = await getRedis().get(`claims:triage:result:${claimId}`);
-  return raw ? (JSON.parse(raw) as T) : null;
-}
-
-export async function writeCachedTriage(
+/**
+ * Write a triage result to the cache and atomically return the value that was
+ * stored there previously (or null on a cold miss).
+ *
+ * Uses the Redis ≥ 6.2 `SET key value GET EX ttl` form so the caller gets the
+ * old value in a single round-trip — no separate GET needed.
+ */
+export async function writeCachedTriage<T>(
   claimId: string,
   value: unknown,
   ttlSeconds = 900,
-): Promise<void> {
-  await getRedis().set(
+): Promise<T | null> {
+  // ioredis types `SET … GET` as returning `string | null`.
+  const previous = await (getRedis() as Redis).call(
+    'SET',
     `claims:triage:result:${claimId}`,
     JSON.stringify(value),
+    'GET',
     'EX',
-    ttlSeconds,
-  );
+    String(ttlSeconds),
+  ) as string | null;
+  return previous ? (JSON.parse(previous) as T) : null;
+}
+
+/**
+ * Read a cached triage result without disturbing the stored value.
+ * Returns null on a cache miss.
+ */
+export async function readCachedTriage<T>(claimId: string): Promise<T | null> {
+  const raw = await getRedis().get(`claims:triage:result:${claimId}`);
+  return raw ? (JSON.parse(raw) as T) : null;
 }
