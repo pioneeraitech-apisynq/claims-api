@@ -1,6 +1,6 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
-import { TRIAGE_MODEL, openai } from '../../openai.provider';
+import { TRIAGE_MODEL, openai, withRetry } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
@@ -11,7 +11,7 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
@@ -89,14 +89,14 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  const { object } = await withRetry(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
