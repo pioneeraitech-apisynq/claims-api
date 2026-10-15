@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -152,6 +151,10 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * Double-checked locking pattern: the cache is re-read *inside* the lock so
+   * that a waiter which queued behind the first holder always sees the result
+   * written by that holder rather than re-running the agent.
    */
   async triage(
     claimId: string,
@@ -159,6 +162,7 @@ export class ClaimsService {
   ): Promise<TriageAgentOutput> {
     const claim = await this.findOne(claimId);
 
+    // Fast path: serve from cache before attempting to acquire the lock.
     if (!dto.force) {
       const cached = await readCachedTriage<TriageAgentOutput>(claimId);
       if (cached) {
@@ -166,12 +170,21 @@ export class ClaimsService {
       }
     }
 
-    const locked = await acquireTriageLock(claimId);
-    if (!locked) {
+    const token = await acquireTriageLock(claimId);
+    if (!token) {
       throw new ConflictException(`Claim ${claimId} is already being triaged`);
     }
 
     try {
+      // Double-check: a concurrent request may have populated the cache while
+      // we were waiting for the lock. If so, return that result immediately.
+      if (!dto.force) {
+        const cached = await readCachedTriage<TriageAgentOutput>(claimId);
+        if (cached) {
+          return cached;
+        }
+      }
+
       const [policy, coverage] = await Promise.all([
         getPolicy(claim.policyNumber),
         getPolicyCoverage(claim.policyNumber),
@@ -211,7 +224,7 @@ export class ClaimsService {
       await writeCachedTriage(claimId, result);
       return result;
     } finally {
-      await releaseTriageLock(claimId);
+      await releaseTriageLock(claimId, token);
     }
   }
 
