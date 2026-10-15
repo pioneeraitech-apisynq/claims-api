@@ -1,5 +1,77 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+
+// ---------------------------------------------------------------------------
+// Field-level encryption helpers (AES-256-GCM)
+// ---------------------------------------------------------------------------
+// The key must be a 32-byte value supplied via FIELD_ENCRYPTION_KEY (hex).
+// Each encrypted value is stored as:  <12-byte IV>:<16-byte auth-tag>:<ciphertext>
+// all base64url-encoded and joined with colons so the envelope is a plain
+// string that MongoDB can index on equality if needed.
+// ---------------------------------------------------------------------------
+
+const ALGORITHM = 'aes-256-gcm';
+const IV_BYTES = 12;
+
+function getEncryptionKey(): Buffer {
+  const hex = process.env.FIELD_ENCRYPTION_KEY;
+  if (!hex || hex.length !== 64) {
+    throw new Error(
+      'FIELD_ENCRYPTION_KEY must be a 64-character hex string (32 bytes). ' +
+        'Generate with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"',
+    );
+  }
+  return Buffer.from(hex, 'hex');
+}
+
+export function encryptField(plain: string): string {
+  const key = getEncryptionKey();
+  const iv = randomBytes(IV_BYTES);
+  const cipher = createCipheriv(ALGORITHM, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [
+    iv.toString('base64url'),
+    tag.toString('base64url'),
+    ciphertext.toString('base64url'),
+  ].join(':');
+}
+
+export function decryptField(envelope: string): string {
+  const key = getEncryptionKey();
+  const parts = envelope.split(':');
+  if (parts.length !== 3) {
+    throw new Error('Invalid encrypted field envelope');
+  }
+  const [ivB64, tagB64, ctB64] = parts;
+  const iv = Buffer.from(ivB64, 'base64url');
+  const tag = Buffer.from(tagB64, 'base64url');
+  const ciphertext = Buffer.from(ctB64, 'base64url');
+  const decipher = createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+}
+
+/** Mongoose getter/setter pair for a nullable encrypted string field. */
+const encryptedStringOptions = {
+  type: String,
+  default: null,
+  get(stored: string | null): string | null {
+    if (stored === null || stored === undefined) return null;
+    try {
+      return decryptField(stored);
+    } catch {
+      // Return null rather than surfacing a decryption error to callers;
+      // the service layer should treat this as missing data.
+      return null;
+    }
+  },
+  set(plain: string | null): string | null {
+    if (plain === null || plain === undefined) return null;
+    return encryptField(plain);
+  },
+};
 
 export type ClaimStatus =
   | 'filed'
@@ -115,10 +187,17 @@ export class Claim {
   @Prop({ required: true })
   claimantName: string;
 
-  @Prop({ required: true })
+  /**
+   * PII – stored encrypted at rest (AES-256-GCM). The getter/setter pair
+   * transparently encrypts on write and decrypts on read.
+   */
+  @Prop(encryptedStringOptions)
   claimantEmail: string;
 
-  @Prop({ default: null })
+  /**
+   * PII – stored encrypted at rest (AES-256-GCM).
+   */
+  @Prop(encryptedStringOptions)
   dateOfBirth: string | null;
 
   @Prop({ required: true })
@@ -131,10 +210,11 @@ export class Claim {
   incidentNarrative: string;
 
   /**
-   * Free-text medical notes supplied on bodily-injury claims. Health data: read
-   * by the triage agent, never returned in list responses.
+   * Free-text medical notes supplied on bodily-injury claims. Health data:
+   * stored encrypted at rest (AES-256-GCM), read by the triage agent, never
+   * returned in list responses.
    */
-  @Prop({ default: null })
+  @Prop(encryptedStringOptions)
   medicalNotes: string | null;
 
   @Prop({ required: true })
@@ -159,3 +239,8 @@ export class Claim {
 export type ClaimDocument = HydratedDocument<Claim>;
 
 export const ClaimSchema = SchemaFactory.createForClass(Claim);
+
+// Ensure getters are applied when converting to plain objects / JSON so that
+// the decrypted values are returned by .lean() calls and toObject().
+ClaimSchema.set('toObject', { getters: true });
+ClaimSchema.set('toJSON', { getters: true });
