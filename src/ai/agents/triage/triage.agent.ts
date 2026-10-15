@@ -11,11 +11,90 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
  */
+
+// ---------------------------------------------------------------------------
+// Retry helper — 429 / 503 aware with Retry-After + exponential backoff
+// ---------------------------------------------------------------------------
+
+const RETRYABLE_STATUS_CODES = new Set([429, 503]);
+const MAX_RETRY_ATTEMPTS = 4;
+const BASE_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 30_000;
+
+/**
+ * Parses the `Retry-After` header value into milliseconds.
+ * Accepts both delay-seconds (e.g. "2") and HTTP-date formats.
+ * Returns `undefined` when the header is absent or unparseable.
+ */
+function parseRetryAfterMs(retryAfter: string | undefined): number | undefined {
+  if (!retryAfter) return undefined;
+  const delaySeconds = Number(retryAfter);
+  if (Number.isFinite(delaySeconds) && delaySeconds >= 0) {
+    return delaySeconds * 1000;
+  }
+  const date = new Date(retryAfter);
+  if (!Number.isNaN(date.getTime())) {
+    const ms = date.getTime() - Date.now();
+    return ms > 0 ? ms : 0;
+  }
+  return undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Executes `fn`, retrying on HTTP 429 / 503 responses up to
+ * MAX_RETRY_ATTEMPTS times. On each retryable error the wrapper honours the
+ * `Retry-After` response header when present; otherwise it falls back to
+ * exponential backoff with jitter.
+ */
+async function withOpenAIRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      attempt += 1;
+
+      // Extract status code and Retry-After from the error object.
+      // The Vercel AI SDK surfaces HTTP errors as plain objects / APIError
+      // instances that carry `status` and `responseHeaders`.
+      const status: number | undefined = (err as Record<string, unknown>)
+        ?.status as number | undefined;
+      const headers = (err as Record<string, unknown>)
+        ?.responseHeaders as Record<string, string> | undefined;
+      const retryAfterHeader: string | undefined =
+        headers?.['retry-after'] ?? headers?.['Retry-After'];
+
+      const isRetryable =
+        typeof status === 'number' && RETRYABLE_STATUS_CODES.has(status);
+
+      if (!isRetryable || attempt >= MAX_RETRY_ATTEMPTS) {
+        throw err;
+      }
+
+      const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
+      const exponentialMs = Math.min(
+        BASE_BACKOFF_MS * 2 ** (attempt - 1) + Math.random() * BASE_BACKOFF_MS,
+        MAX_BACKOFF_MS,
+      );
+      const waitMs = retryAfterMs !== undefined ? retryAfterMs : exponentialMs;
+
+      await sleep(waitMs);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Schema & types
+// ---------------------------------------------------------------------------
 
 export const triageResultSchema = z.object({
   recommendation: z
@@ -89,14 +168,14 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  const { object } = await withOpenAIRetry(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
