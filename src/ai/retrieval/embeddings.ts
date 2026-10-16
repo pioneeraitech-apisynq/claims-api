@@ -1,5 +1,5 @@
 import { embed, embedMany } from 'ai';
-import { EMBEDDING_MODEL, openai } from '../openai.provider';
+import { EMBEDDING_MODEL, openai, withRetry } from '../openai.provider';
 
 /**
  * Embeddings for policy wording retrieval, produced with OpenAI
@@ -7,17 +7,23 @@ import { EMBEDDING_MODEL, openai } from '../openai.provider';
  * the OpenAI traffic.
  */
 export async function embedQuery(text: string): Promise<number[]> {
-  const { embedding } = await embed({
-    model: openai.embedding(EMBEDDING_MODEL),
-    value: text,
-  });
+  // withRetry handles 429 / 503 with Retry-After-aware exponential backoff.
+  const { embedding } = await withRetry(() =>
+    embed({
+      model: openai.embedding(EMBEDDING_MODEL),
+      value: text,
+    }),
+  );
   return embedding;
 }
 
 export async function embedClauses(texts: string[]): Promise<number[][]> {
-  const { embeddings } = await embedMany({
-    model: openai.embedding(EMBEDDING_MODEL),
-    values: texts,
-  });
+  // withRetry handles 429 / 503 with Retry-After-aware exponential backoff.
+  const { embeddings } = await withRetry(() =>
+    embedMany({
+      model: openai.embedding(EMBEDDING_MODEL),
+      values: texts,
+    }),
+  );
   return embeddings;
 }
