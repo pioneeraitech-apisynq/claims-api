@@ -12,11 +12,25 @@ let client: Redis | null = null;
 export function getRedis(): Redis {
   if (!client) {
     client = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-      maxRetriesPerRequest: 2,
+      // Do NOT set maxRetriesPerRequest here — the ioredis default (null) queues
+      // commands while reconnecting, which is the correct behaviour for transient
+      // outages (leader elections, rolling restarts).  Fast-fail would surface
+      // recoverable blips as 5xx errors to API consumers.
       lazyConnect: false,
     });
   }
   return client;
+}
+
+/**
+ * Gracefully close the Redis connection, flushing any pending commands first.
+ * Call this from the application's shutdown hook (SIGTERM / SIGINT).
+ */
+export async function closeRedis(): Promise<void> {
+  if (client) {
+    await client.quit();
+    client = null;
+  }
 }
 
 const LOCK_TTL_SECONDS = 60;
@@ -49,10 +63,21 @@ export async function writeCachedTriage(
   value: unknown,
   ttlSeconds = 900,
 ): Promise<void> {
-  await getRedis().set(
+  // Use SET … GET (Redis 6.2+) so the operation is atomic: we write the new
+  // value and receive the previous value in one round-trip.  A non-null
+  // previous value means a concurrent request already populated the cache;
+  // we log it so races are observable without treating them as errors.
+  const previous = await getRedis().set(
     `claims:triage:result:${claimId}`,
     JSON.stringify(value),
+    'GET',
     'EX',
     ttlSeconds,
   );
+  if (previous !== null) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[redis] writeCachedTriage: concurrent write detected for claim ${claimId} — previous value was overwritten`,
+    );
+  }
 }
