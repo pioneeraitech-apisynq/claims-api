@@ -48,6 +48,10 @@ export async function searchPolicyWording(
 /**
  * Index (or re-index) the clauses of a product wording document. Run when a
  * wording is published or amended.
+ *
+ * @returns the number of clauses successfully indexed.
+ * @throws if Pinecone reports one or more upsert errors, so the caller is
+ *         never left with a silently-partial index.
  */
 export async function indexPolicyWording(
   productType: string,
@@ -55,7 +59,7 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
+  const response = await policyWordingIndex()
     .namespace(POLICY_WORDING_NAMESPACE)
     .upsert(
       clauses.map((clause, index) => ({
@@ -68,6 +72,13 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  if (response?.errors && response.errors.length > 0) {
+    throw new Error(
+      `Pinecone upsert completed with ${response.errors.length} error(s) for productType "${productType}": ` +
+        response.errors.map((e: { message?: string }) => e.message ?? JSON.stringify(e)).join('; '),
+    );
+  }
 
   return clauses.length;
 }
