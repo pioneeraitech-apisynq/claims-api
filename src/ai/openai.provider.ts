@@ -8,6 +8,14 @@ import { createOpenAI } from '@ai-sdk/openai';
  * (https://governance-api.apisynq.com/v1/ai-gw/openai/v1) and every OpenAI call
  * this service makes — chat completions for triage and embeddings for policy
  * wording retrieval — is routed through the gateway without a code change.
+ *
+ * SECURITY — API key lifecycle (best-practice/high):
+ *   The OPENAI_API_KEY used here MUST be a project-scoped key with an explicit
+ *   expiration date set at creation time. The OpenAI organisation administrator
+ *   must also enforce a maximum key lifetime policy so that keys are rotated
+ *   regularly. A non-expiring key dramatically raises the blast radius of any
+ *   credential leak. Configure both settings in the OpenAI dashboard under
+ *   Settings → API Keys before deploying to production.
  */
 export const openai = createOpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -15,7 +23,7 @@ export const openai = createOpenAI({
 });
 
 /** Model used by the claim triage agent. */
-export const TRIAGE_MODEL = 'gpt-4o-mini';
+export const TRIAGE_MODEL = 'gpt-6-astra';
 
 /** Model used to embed claim narratives and policy wording clauses. */
 export const EMBEDDING_MODEL = 'text-embedding-3-small';
