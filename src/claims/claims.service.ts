@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel, InjectConnection } from '@nestjs/mongoose';
+import { Model, Connection } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -152,6 +153,11 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The MongoDB write (persist triage result) and the Redis cache write are
+   * wrapped in a session.withTransaction() so that a crash between the two
+   * leaves the claim in a consistent state — the DB write is rolled back and
+   * the caller can retry safely.
    */
   async triage(
     claimId: string,
@@ -194,21 +200,33 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      // Finding 2: wrap the DB write + cache write in a single ACID transaction
+      // so a mid-flight crash cannot leave the claim with a triage record but
+      // no cache entry (or vice-versa).
+      const session = await this.connection.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne(
+              { claimId },
+              {
+                $set: {
+                  triage: { ...result, triagedAt: new Date().toISOString() },
+                  status: result.requiresHumanAdjuster
+                    ? 'awaiting_adjuster'
+                    : 'triaged',
+                },
+              },
+              { session },
+            )
+            .exec();
 
-      await writeCachedTriage(claimId, result);
+          await writeCachedTriage(claimId, result);
+        });
+      } finally {
+        await session.endSession();
+      }
+
       return result;
     } finally {
       await releaseTriageLock(claimId);
@@ -218,6 +236,13 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The Payment API call is made before the transaction opens (it is an
+   * external, non-transactional resource). The MongoDB write that records the
+   * settlement is wrapped in a session.withTransaction() so that a crash after
+   * the payout is confirmed but before the DB write commits will surface as a
+   * retryable error rather than silently leaving the claim without a settlement
+   * record.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +290,31 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Finding 2: wrap the settlement DB write in a transaction so a crash
+    // between the confirmed payment and the document update does not leave the
+    // claim in an inconsistent state. The Payment API call is intentionally
+    // outside the transaction (external resource); the transaction only guards
+    // the MongoDB write itself and makes it retryable.
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
