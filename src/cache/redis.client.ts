@@ -12,14 +12,47 @@ let client: Redis | null = null;
 export function getRedis(): Redis {
   if (!client) {
     client = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-      maxRetriesPerRequest: 2,
+      maxRetriesPerRequest: 3,
       lazyConnect: false,
+    });
+    // Attach an error listener immediately so that transient connectivity
+    // failures are logged rather than thrown as unhandled 'error' events,
+    // which would otherwise crash the Node.js process. (Finding 2)
+    client.on('error', (err: Error) => {
+      // eslint-disable-next-line no-console
+      console.error('[redis] connection error:', err);
     });
   }
   return client;
 }
 
+/**
+ * Cleanly close the Redis connection. Should be called during application
+ * shutdown (e.g. OnApplicationShutdown) so the event loop can drain and the
+ * server-side connection is released. (Finding 4)
+ */
+export async function closeRedis(): Promise<void> {
+  if (client) {
+    await client.quit();
+    client = null;
+  }
+}
+
 const LOCK_TTL_SECONDS = 60;
+
+/**
+ * Lua script for atomic check-and-delete: only deletes the lock key when the
+ * stored value matches the caller's identity, preventing a stale release from
+ * removing a lock that was re-acquired by another worker after TTL expiry.
+ * (Finding 1)
+ */
+const RELEASE_LOCK_SCRIPT = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+else
+  return 0
+end
+`;
 
 /**
  * Acquire a lock for a claim. Returns false when another worker holds it.
@@ -35,8 +68,18 @@ export async function acquireTriageLock(claimId: string): Promise<boolean> {
   return result === 'OK';
 }
 
+/**
+ * Release the triage lock only when we still own it. Uses an atomic Lua
+ * check-and-delete to avoid silently deleting a lock re-acquired by another
+ * worker after our TTL expired. (Finding 1)
+ */
 export async function releaseTriageLock(claimId: string): Promise<void> {
-  await getRedis().del(`claims:triage:lock:${claimId}`);
+  await getRedis().eval(
+    RELEASE_LOCK_SCRIPT,
+    1,
+    `claims:triage:lock:${claimId}`,
+    process.pid.toString(),
+  );
 }
 
 export async function readCachedTriage<T>(claimId: string): Promise<T | null> {
