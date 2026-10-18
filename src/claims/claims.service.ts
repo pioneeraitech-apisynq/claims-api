@@ -4,8 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectModel } from '@nestjs/mongoose';\nimport { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -20,6 +19,7 @@ import {
 import { putClaimDocument } from '../storage/s3.client';
 import {
   acquireTriageLock,
+  getRedis,
   readCachedTriage,
   releaseTriageLock,
   writeCachedTriage,
@@ -152,6 +152,11 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * When `force` is true the existing cache entry is invalidated *before* the
+   * lock is acquired so that any reader racing between the old and new writes
+   * always sees either the old entry (pre-lock) or the fresh one (post-write),
+   * never a gap (finding #5).
    */
   async triage(
     claimId: string,
@@ -172,6 +177,13 @@ export class ClaimsService {
     }
 
     try {
+      // Invalidate any stale cache entry now that we hold the lock, so a
+      // concurrent reader cannot receive a result from a previous triage run
+      // while this one is in progress (finding #5).
+      if (dto.force) {
+        await getRedis().del(`claims:triage:result:${claimId}`);
+      }
+
       const [policy, coverage] = await Promise.all([
         getPolicy(claim.policyNumber),
         getPolicyCoverage(claim.policyNumber),
