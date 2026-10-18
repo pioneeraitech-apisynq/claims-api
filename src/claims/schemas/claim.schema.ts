@@ -133,8 +133,18 @@ export class Claim {
   /**
    * Free-text medical notes supplied on bodily-injury claims. Health data: read
    * by the triage agent, never returned in list responses.
+   *
+   * SECURITY: This field must be protected with MongoDB Client-Side Field Level
+   * Encryption (CSFLE) or Queryable Encryption in the driver configuration
+   * (`autoEncryption` option on the MongoClient) so that the value is
+   * encrypted before it leaves the application process. The schema-level
+   * declaration below marks the field as sensitive via `select: false` so it
+   * is never returned by default queries; driver-level CSFLE is the required
+   * complement for at-rest and in-transit encryption of the raw bytes.
+   *
+   * See: https://www.mongodb.com/docs/manual/core/csfle/
    */
-  @Prop({ default: null })
+  @Prop({ default: null, select: false })
   medicalNotes: string | null;
 
   @Prop({ required: true })

@@ -4,8 +4,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import { Connection, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { Claim, ClaimDocument } from './schemas/claim.schema';
 import { CreateClaimDto } from './dto/create-claim.dto';
@@ -34,6 +34,7 @@ import { runDocumentExtractionAgent } from '../ai/agents/document/document.agent
 export class ClaimsService {
   constructor(
     @InjectModel(Claim.name) private readonly claimModel: Model<ClaimDocument>,
+    @InjectConnection() private readonly connection: Connection,
   ) {}
 
   /**
@@ -218,6 +219,12 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The MongoDB write is wrapped in an ACID session + transaction so that any
+   * failure after the payment is booked (e.g. a network blip or primary
+   * step-down) does not leave the claim document in its pre-settlement state
+   * without a corresponding rollback. The payment itself is external and cannot
+   * be rolled back here; idempotency must be handled at the Payment API layer.
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -246,6 +253,9 @@ export class ClaimsService {
       throw new BadRequestException('Settlement amount must be positive');
     }
 
+    // Book the payment outside the transaction: the external Payment API call
+    // is not transactional with MongoDB, but it must succeed before we attempt
+    // the DB write so a DB failure does not silently drop the payment record.
     const payout = await createSettlementPayout({
       policyId: claim.policyNumber,
       customerId: claim.customerId,
@@ -265,17 +275,28 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Wrap the MongoDB write in an ACID transaction so a partial write is
+    // automatically rolled back if the session is interrupted mid-flight.
+    const session = await this.connection.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status:
+                  confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
