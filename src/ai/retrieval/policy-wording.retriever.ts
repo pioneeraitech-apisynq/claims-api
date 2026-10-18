@@ -1,5 +1,9 @@
 import { embedClauses, embedQuery } from './embeddings';
-import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client';
+import {
+  getPolicyWordingAliasName,
+  policyWordingIndex,
+  swapPolicyWordingNamespaceAlias,
+} from './pinecone.client';
 
 /**
  * Retrieval-augmented search over policy wording.
@@ -25,7 +29,7 @@ export async function searchPolicyWording(
   const vector = await embedQuery(narrative);
 
   const result = await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+    .namespace(getPolicyWordingAliasName())
     .query({
       vector,
       topK,
@@ -48,6 +52,12 @@ export async function searchPolicyWording(
 /**
  * Index (or re-index) the clauses of a product wording document. Run when a
  * wording is published or amended.
+ *
+ * Strategy (finding 2 — zero-downtime swap):
+ *   1. Write all vectors into a timestamped shadow namespace.
+ *   2. Verify the upsert response for partial failures (finding 1).
+ *   3. Atomically repoint the namespace alias to the shadow namespace so
+ *      live reads immediately see the new data without a gap window.
  */
 export async function indexPolicyWording(
   productType: string,
@@ -55,8 +65,12 @@ export async function indexPolicyWording(
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+  // Use a timestamped shadow namespace so the live alias is untouched until
+  // the write is fully verified (finding 2).
+  const shadowNamespace = `policy-wording-shadow-${Date.now()}`;
+
+  const upsertResponse = await policyWordingIndex()
+    .namespace(shadowNamespace)
     .upsert(
       clauses.map((clause, index) => ({
         id: clause.clauseId,
@@ -68,6 +82,23 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  // Guard against partial failures — the SDK surfaces these on the response
+  // object rather than throwing (finding 1).
+  const upsertedCount =
+    (upsertResponse as { upsertedCount?: number } | undefined)
+      ?.upsertedCount ?? clauses.length;
+
+  if (upsertedCount < clauses.length) {
+    throw new Error(
+      `Pinecone upsert partial failure for productType="${productType}": ` +
+        `expected ${clauses.length} vectors but only ${upsertedCount} were written. ` +
+        `Shadow namespace "${shadowNamespace}" was NOT promoted to the live alias.`,
+    );
+  }
+
+  // All vectors confirmed written — atomically swap the alias (finding 2).
+  await swapPolicyWordingNamespaceAlias(shadowNamespace);
 
   return clauses.length;
 }
