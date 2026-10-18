@@ -11,8 +11,8 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
+ * Runs OpenAI through the Vercel AI SDK with a zod-constrained result.
+ * Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
  */
@@ -94,8 +94,7 @@ export async function runTriageAgent(
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
+    maxRetries: 0, // Retry-After / backoff is handled in the provider's fetch wrapper
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
