@@ -48,15 +48,22 @@ export async function searchPolicyWording(
 /**
  * Index (or re-index) the clauses of a product wording document. Run when a
  * wording is published or amended.
+ *
+ * Accepts an optional `targetNamespace` so callers can write into a staging
+ * namespace and then atomically swap the alias (see swapPolicyWordingNamespace)
+ * for zero-downtime re-index operations.
  */
 export async function indexPolicyWording(
   productType: string,
   clauses: { clauseId: string; heading: string; text: string }[],
+  targetNamespace: string = POLICY_WORDING_NAMESPACE,
 ): Promise<number> {
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
-  await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+  // Finding 3: capture the response and surface any partial-failure errors
+  // rather than assuming all vectors were written successfully.
+  const response = await policyWordingIndex()
+    .namespace(targetNamespace)
     .upsert(
       clauses.map((clause, index) => ({
         id: clause.clauseId,
@@ -68,6 +75,12 @@ export async function indexPolicyWording(
         },
       })),
     );
+
+  if (response.errors && response.errors.length > 0) {
+    throw new Error(
+      `Pinecone upsert partially failed for productType "${productType}": ${JSON.stringify(response.errors)}`,
+    );
+  }
 
   return clauses.length;
 }
