@@ -11,7 +11,7 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
@@ -74,6 +74,91 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Maximum number of attempts (1 initial + 4 retries) for rate-limit /
+ * overload errors.  Kept conservative so a runaway retry loop can never
+ * occupy a worker for more than ~30 s in the worst case.
+ */
+const MAX_ATTEMPTS = 5;
+
+/**
+ * Calls `generateObject` with Retry-After-aware exponential backoff.
+ *
+ * On a 429 (rate_limit_exceeded / slow_down) or 503 (server_is_overloaded)
+ * response the function:
+ *   1. Reads the `Retry-After` header (seconds) if present.
+ *   2. Falls back to exponential backoff (1 s × 2^attempt) when the header is
+ *      absent or unparseable.
+ *   3. Waits, then retries up to MAX_ATTEMPTS total attempts.
+ *
+ * All other errors are re-thrown immediately so the caller sees them without
+ * delay.
+ */
+async function generateObjectWithBackoff(
+  ...args: Parameters<typeof generateObject>
+): Promise<Awaited<ReturnType<typeof generateObject>>> {
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      // generateObject is generic; the single spread covers all overloads.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return await (generateObject as any)(...args);
+    } catch (err: unknown) {
+      const isRetryable = isRateLimitOrOverload(err);
+
+      if (!isRetryable || attempt === MAX_ATTEMPTS - 1) {
+        throw err;
+      }
+
+      const delayMs = retryAfterMs(err, attempt);
+      await sleep(delayMs);
+    }
+  }
+
+  // Unreachable, but satisfies TypeScript's control-flow analysis.
+  throw new Error('generateObjectWithBackoff: exhausted retries unexpectedly');
+}
+
+/** Returns true for HTTP 429 and 503 responses from the OpenAI SDK. */
+function isRateLimitOrOverload(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const status = (err as Record<string, unknown>)['status'] ??
+    (err as Record<string, unknown>)['statusCode'];
+  return status === 429 || status === 503;
+}
+
+/**
+ * Extracts the wait duration in milliseconds from a failed response.
+ *
+ * Prefers the `Retry-After` header (an integer number of seconds).
+ * Falls back to `2^attempt` seconds (1 s, 2 s, 4 s, 8 s, …) with a
+ * ±10 % jitter to avoid thundering-herd problems.
+ */
+function retryAfterMs(err: unknown, attempt: number): number {
+  if (err && typeof err === 'object') {
+    // The Vercel AI SDK surfaces response headers on `responseHeaders`.
+    const headers = (err as Record<string, unknown>)['responseHeaders'] as
+      | Record<string, string>
+      | undefined;
+    const headerValue =
+      headers?.['retry-after'] ?? headers?.['Retry-After'];
+    if (headerValue) {
+      const seconds = parseInt(headerValue, 10);
+      if (!isNaN(seconds) && seconds > 0) {
+        return seconds * 1_000;
+      }
+    }
+  }
+
+  // Exponential backoff: 1 s, 2 s, 4 s, 8 s, … capped at 32 s.
+  const baseMs = Math.min(1_000 * Math.pow(2, attempt), 32_000);
+  const jitter = baseMs * 0.1 * (Math.random() * 2 - 1); // ±10 %
+  return Math.round(baseMs + jitter);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,13 +174,11 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
+  const { object } = await generateObjectWithBackoff({
     model: openai(TRIAGE_MODEL),
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
   });
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
