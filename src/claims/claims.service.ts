@@ -152,6 +152,10 @@ export class ClaimsService {
    * A Redis lock keeps two concurrent calls from running the model twice, and
    * the result is cached under the claim id so a repeat call inside the TTL is
    * served without another model call.
+   *
+   * The final DB write is wrapped in a MongoDB session transaction so that a
+   * failed updateOne does not leave the claim in a stale state after the agent
+   * has already completed (finding 3).
    */
   async triage(
     claimId: string,
@@ -194,19 +198,29 @@ export class ClaimsService {
         fastTrackThresholdCents: dto.fastTrackThresholdCents,
       });
 
-      await this.claimModel
-        .updateOne(
-          { claimId },
-          {
-            $set: {
-              triage: { ...result, triagedAt: new Date().toISOString() },
-              status: result.requiresHumanAdjuster
-                ? 'awaiting_adjuster'
-                : 'triaged',
-            },
-          },
-        )
-        .exec();
+      // Wrap the DB write in a session transaction so a driver-level failure
+      // after the agent call does not leave the claim document stale.
+      const session = await this.claimModel.db.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await this.claimModel
+            .updateOne(
+              { claimId },
+              {
+                $set: {
+                  triage: { ...result, triagedAt: new Date().toISOString() },
+                  status: result.requiresHumanAdjuster
+                    ? 'awaiting_adjuster'
+                    : 'triaged',
+                },
+              },
+              { session },
+            )
+            .exec();
+        });
+      } finally {
+        await session.endSession();
+      }
 
       await writeCachedTriage(claimId, result);
       return result;
@@ -218,6 +232,10 @@ export class ClaimsService {
   /**
    * Settle a claim. The payout is capped at the policy's coverage limit and
    * booked through the Payment API, which owns the money movement.
+   *
+   * The DB write is wrapped in a MongoDB session transaction so that a failed
+   * updateOne after money has already moved does not leave the claim document
+   * in a stale/inconsistent state (finding 3).
    */
   async settle(claimId: string, dto: SettleClaimDto) {
     const claim = await this.findOne(claimId);
@@ -265,17 +283,28 @@ export class ClaimsService {
       settledAt: new Date().toISOString(),
     };
 
-    await this.claimModel
-      .updateOne(
-        { claimId },
-        {
-          $set: {
-            settlement,
-            status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
-          },
-        },
-      )
-      .exec();
+    // Wrap the DB write in a session transaction so a driver-level failure
+    // after the Payment API call does not leave the claim document stale
+    // (money moved but claim still shows its previous status).
+    const session = await this.claimModel.db.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await this.claimModel
+          .updateOne(
+            { claimId },
+            {
+              $set: {
+                settlement,
+                status: confirmed.status === 'succeeded' ? 'settled' : 'approved',
+              },
+            },
+            { session },
+          )
+          .exec();
+      });
+    } finally {
+      await session.endSession();
+    }
 
     return settlement;
   }
