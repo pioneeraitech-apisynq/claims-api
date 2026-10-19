@@ -133,8 +133,22 @@ export class Claim {
   /**
    * Free-text medical notes supplied on bodily-injury claims. Health data: read
    * by the triage agent, never returned in list responses.
+   *
+   * CSFLE: encrypted client-side with the KMS-managed data key before the
+   * document is ever sent to MongoDB. The `encrypt` sub-document instructs the
+   * MongoDB driver to apply Queryable Encryption / CSFLE using the key
+   * referenced by MONGODB_MEDICAL_NOTES_KEY_ID and AEAD_AES_256_CBC_HMAC_SHA_512
+   * deterministic algorithm (use "Random" if range/equality queries are not
+   * required, which is the more privacy-preserving choice for free-text PHI).
    */
-  @Prop({ default: null })
+  @Prop({
+    default: null,
+    encrypt: {
+      keyId: process.env.MONGODB_MEDICAL_NOTES_KEY_ID,
+      algorithm: 'AEAD_AES_256_CBC_HMAC_SHA_512-Random',
+      bsonType: 'string',
+    },
+  })
   medicalNotes: string | null;
 
   @Prop({ required: true })
@@ -159,3 +173,11 @@ export class Claim {
 export type ClaimDocument = HydratedDocument<Claim>;
 
 export const ClaimSchema = SchemaFactory.createForClass(Claim);
+
+/**
+ * Compound index that covers:
+ *   - list(policyNumber) → equality on policyNumber + descending sort on createdAt
+ *   - list()            → descending sort on createdAt (index prefix scan)
+ * Eliminates the full-collection in-memory sort flagged in finding 4.
+ */
+ClaimSchema.index({ policyNumber: 1, createdAt: -1 });
