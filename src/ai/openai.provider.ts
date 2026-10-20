@@ -1,18 +1,24 @@
-import { createOpenAI } from '@ai-sdk/openai';
+import { createGateway } from '@ai-sdk/gateway';
 
 /**
- * Gateway-ready OpenAI provider.
+ * Vercel AI Gateway provider.
  *
- * The base URL is read from OPENAI_BASE_URL and defaults to the public OpenAI
- * API. Point that one variable at the APISynQ AI gateway
- * (https://governance-api.apisynq.com/v1/ai-gw/openai/v1) and every OpenAI call
- * this service makes — chat completions for triage and embeddings for policy
- * wording retrieval — is routed through the gateway without a code change.
+ * All model traffic — OpenAI chat completions, OpenAI embeddings, and Anthropic
+ * completions — is routed through a single Vercel AI Gateway integration point.
+ * Set AI_GATEWAY_URL to your APISynQ gateway base URL
+ * (e.g. https://governance-api.apisynq.com/v1/ai-gw) and AI_GATEWAY_API_KEY to
+ * the corresponding key; the defaults fall back to the public Vercel AI Gateway.
  */
-export const openai = createOpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+const gateway = createGateway({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  baseURL: process.env.AI_GATEWAY_URL,
 });
+
+/** Gateway-scoped OpenAI provider (chat completions + embeddings). */
+export const openai = gateway.openai;
+
+/** Gateway-scoped Anthropic provider (document extraction). */
+export const anthropic = gateway.anthropic;
 
 /** Model used by the claim triage agent. */
 export const TRIAGE_MODEL = 'gpt-4o-mini';
