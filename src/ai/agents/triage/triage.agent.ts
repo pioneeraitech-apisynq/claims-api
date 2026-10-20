@@ -11,7 +11,7 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
  * result. Before the model is called, the claim narrative is used to retrieve
  * the relevant policy wording clauses from Pinecone, so the agent quotes real
  * wording instead of paraphrasing from memory.
@@ -74,6 +74,53 @@ export interface TriageAgentOutput extends TriageResult {
 
 const DEFAULT_FAST_TRACK_THRESHOLD_CENTS = 250_000;
 
+/**
+ * Calls `fn` up to `maxAttempts` times, honouring the `Retry-After` response
+ * header on 429 / 503 errors and falling back to exponential backoff when the
+ * header is absent.
+ */
+async function withRetryAfterBackoff<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 4,
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      attempt += 1;
+      if (attempt >= maxAttempts) throw err;
+
+      // Extract status and headers from SDK / fetch-style error shapes.
+      const status: number | undefined =
+        (err as { status?: number; statusCode?: number }).status ??
+        (err as { status?: number; statusCode?: number }).statusCode;
+
+      if (status !== 429 && status !== 503) throw err;
+
+      const headers: Record<string, string> | undefined = (
+        err as { headers?: Record<string, string> }
+      ).headers;
+
+      const retryAfterRaw = headers?.['retry-after'];
+      let delayMs: number;
+
+      if (retryAfterRaw) {
+        const seconds = Number(retryAfterRaw);
+        delayMs = isFinite(seconds)
+          ? seconds * 1_000
+          : // HTTP-date fallback
+            Math.max(0, new Date(retryAfterRaw).getTime() - Date.now());
+      } else {
+        // Exponential backoff: 1 s, 2 s, 4 s, …
+        delayMs = Math.pow(2, attempt - 1) * 1_000;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export async function runTriageAgent(
   input: TriageAgentInput,
 ): Promise<TriageAgentOutput> {
@@ -89,14 +136,16 @@ export async function runTriageAgent(
     clauses,
   };
 
-  const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
-    system: TRIAGE_SYSTEM_PROMPT,
-    prompt: buildTriagePrompt(promptInput),
-    temperature: 0.1,
-    maxRetries: 2,
-  });
+  const { object } = await withRetryAfterBackoff(() =>
+    generateObject({
+      model: openai(TRIAGE_MODEL),
+      schema: triageResultSchema,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt: buildTriagePrompt(promptInput),
+      // temperature omitted: gpt-6-astra does not support custom temperature
+      maxRetries: 0, // retries are handled by withRetryAfterBackoff above
+    }),
+  );
 
   // The model is asked not to exceed the coverage limit; enforce it anyway so a
   // bad generation can never book an over-limit payout.
