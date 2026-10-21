@@ -19,5 +19,19 @@ export function policyWordingIndex() {
   return getPinecone().index(indexName);
 }
 
+/**
+ * Name of the namespace *alias* that always points to the live policy-wording
+ * namespace. Use the Pinecone console (or the Aliases API) to atomically
+ * repoint this alias to a freshly-indexed namespace whenever new wording is
+ * published — no redeployment or maintenance window required.
+ *
+ * To set up:
+ *   1. Index new wording into a versioned namespace (e.g. "policy-wording-v2").
+ *   2. Create / update the alias "policy-wording-current" → "policy-wording-v2"
+ *      via the Pinecone console or: pc.indexes.namespaces.aliases.upsert(...)
+ *   3. All queries and upserts below automatically resolve to the new namespace.
+ *
+ * PINECONE_NAMESPACE_ALIAS overrides the alias name at deploy time if needed.
+ */
 export const POLICY_WORDING_NAMESPACE =
-  process.env.PINECONE_NAMESPACE || 'policy-wording-v1';
+  process.env.PINECONE_NAMESPACE_ALIAS || 'policy-wording-current';
