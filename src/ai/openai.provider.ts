@@ -14,8 +14,17 @@ export const openai = createOpenAI({
   baseURL: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
 });
 
+/**
+ * Responses-API surface of the same provider instance.
+ *
+ * GPT-6 Astra requires the Responses API for tool calling and schema-
+ * constrained generation. Use this wrapper (instead of `openai`) wherever
+ * `generateObject` / `generateText` is called with TRIAGE_MODEL.
+ */
+export const openaiResponses = openai.responses;
+
 /** Model used by the claim triage agent. */
-export const TRIAGE_MODEL = 'gpt-4o-mini';
+export const TRIAGE_MODEL = 'gpt-6-astra';
 
 /** Model used to embed claim narratives and policy wording clauses. */
 export const EMBEDDING_MODEL = 'text-embedding-3-small';
