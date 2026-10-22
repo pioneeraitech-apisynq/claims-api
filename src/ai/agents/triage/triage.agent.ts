@@ -1,6 +1,6 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
-import { TRIAGE_MODEL, openai } from '../../openai.provider';
+import { TRIAGE_MODEL, openaiResponses } from '../../openai.provider';
 import { searchPolicyWording } from '../../retrieval/policy-wording.retriever';
 import {
   TRIAGE_SYSTEM_PROMPT,
@@ -11,10 +11,13 @@ import {
 /**
  * Claim triage agent.
  *
- * Runs OpenAI gpt-4o-mini through the Vercel AI SDK with a zod-constrained
- * result. Before the model is called, the claim narrative is used to retrieve
- * the relevant policy wording clauses from Pinecone, so the agent quotes real
- * wording instead of paraphrasing from memory.
+ * Runs OpenAI gpt-6-astra through the Vercel AI SDK with a zod-constrained
+ * result. GPT-6 Astra requires the Responses API for schema-constrained
+ * (tool-calling) generation, so the model is provided via `openaiResponses`
+ * rather than the Chat Completions surface. Before the model is called, the
+ * claim narrative is used to retrieve the relevant policy wording clauses from
+ * Pinecone, so the agent quotes real wording instead of paraphrasing from
+ * memory.
  */
 
 export const triageResultSchema = z.object({
@@ -89,8 +92,11 @@ export async function runTriageAgent(
     clauses,
   };
 
+  // GPT-6 Astra requires the Responses API for schema-constrained generation.
+  // openaiResponses is the .responses() surface of the same provider instance,
+  // which routes through the Responses API instead of Chat Completions.
   const { object } = await generateObject({
-    model: openai(TRIAGE_MODEL),
+    model: openaiResponses(TRIAGE_MODEL),
     schema: triageResultSchema,
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
