@@ -1,5 +1,5 @@
 import { embedClauses, embedQuery } from './embeddings';
-import { POLICY_WORDING_NAMESPACE, policyWordingIndex } from './pinecone.client';
+import { policyWordingIndex, policyWordingNamespace } from './pinecone.client';
 
 /**
  * Retrieval-augmented search over policy wording.
@@ -25,7 +25,7 @@ export async function searchPolicyWording(
   const vector = await embedQuery(narrative);
 
   const result = await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+    .namespace(policyWordingNamespace())
     .query({
       vector,
       topK,
@@ -56,7 +56,7 @@ export async function indexPolicyWording(
   const vectors = await embedClauses(clauses.map((clause) => clause.text));
 
   await policyWordingIndex()
-    .namespace(POLICY_WORDING_NAMESPACE)
+    .namespace(policyWordingNamespace())
     .upsert(
       clauses.map((clause, index) => ({
         id: clause.clauseId,
