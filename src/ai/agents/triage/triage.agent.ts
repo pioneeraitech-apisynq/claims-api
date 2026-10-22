@@ -17,50 +17,61 @@ import {
  * wording instead of paraphrasing from memory.
  */
 
-export const triageResultSchema = z.object({
-  recommendation: z
-    .enum(['fast_track', 'standard_review', 'adjuster_review', 'decline'])
-    .describe('Recommended handling route for this claim'),
-  severity: z
-    .enum(['minor', 'moderate', 'major', 'catastrophic'])
-    .describe('Severity of the loss as described in the narrative'),
-  coveredUnderPolicy: z
-    .boolean()
-    .describe('Whether the retrieved wording covers the described loss'),
-  citedClauseId: z
-    .string()
-    .nullable()
-    .describe('Id of the retrieved clause the recommendation rests on'),
-  quotedClause: z
-    .string()
-    .nullable()
-    .describe('The cited clause quoted verbatim'),
-  recommendedPayoutCents: z
-    .number()
-    .int()
-    .min(0)
-    .describe('Recommended payout, never above the coverage limit'),
-  fraudIndicators: z
-    .array(z.string())
-    .describe('Concrete fraud signals found in the narrative, dates or amounts'),
-  requiresHumanAdjuster: z
-    .boolean()
-    .describe('True when a human adjuster must review before any payout'),
-  missingInformation: z
-    .array(z.string())
-    .describe('Facts or documents needed before the claim can be decided'),
-  rationale: z
-    .string()
-    .max(1200)
-    .describe('Short explanation of the recommendation for the adjuster'),
-  confidence: z
-    .number()
-    .min(0)
-    .max(1)
-    .describe('Model confidence in the recommendation'),
-});
+let _triageResultSchema: ReturnType<typeof buildTriageResultSchema> | undefined;
 
-export type TriageResult = z.infer<typeof triageResultSchema>;
+function buildTriageResultSchema() {
+  return z.object({
+    recommendation: z
+      .enum(['fast_track', 'standard_review', 'adjuster_review', 'decline'])
+      .describe('Recommended handling route for this claim'),
+    severity: z
+      .enum(['minor', 'moderate', 'major', 'catastrophic'])
+      .describe('Severity of the loss as described in the narrative'),
+    coveredUnderPolicy: z
+      .boolean()
+      .describe('Whether the retrieved wording covers the described loss'),
+    citedClauseId: z
+      .string()
+      .nullable()
+      .describe('Id of the retrieved clause the recommendation rests on'),
+    quotedClause: z
+      .string()
+      .nullable()
+      .describe('The cited clause quoted verbatim'),
+    recommendedPayoutCents: z
+      .number()
+      .int()
+      .min(0)
+      .describe('Recommended payout, never above the coverage limit'),
+    fraudIndicators: z
+      .array(z.string())
+      .describe('Concrete fraud signals found in the narrative, dates or amounts'),
+    requiresHumanAdjuster: z
+      .boolean()
+      .describe('True when a human adjuster must review before any payout'),
+    missingInformation: z
+      .array(z.string())
+      .describe('Facts or documents needed before the claim can be decided'),
+    rationale: z
+      .string()
+      .max(1200)
+      .describe('Short explanation of the recommendation for the adjuster'),
+    confidence: z
+      .number()
+      .min(0)
+      .max(1)
+      .describe('Model confidence in the recommendation'),
+  });
+}
+
+function getTriageResultSchema() {
+  if (!_triageResultSchema) {
+    _triageResultSchema = buildTriageResultSchema();
+  }
+  return _triageResultSchema;
+}
+
+export type TriageResult = z.infer<ReturnType<typeof buildTriageResultSchema>>;
 
 export interface TriageAgentInput
   extends Omit<TriagePromptInput, 'clauses' | 'fastTrackThresholdCents'> {
@@ -91,7 +102,7 @@ export async function runTriageAgent(
 
   const { object } = await generateObject({
     model: openai(TRIAGE_MODEL),
-    schema: triageResultSchema,
+    schema: getTriageResultSchema(),
     system: TRIAGE_SYSTEM_PROMPT,
     prompt: buildTriagePrompt(promptInput),
     temperature: 0.1,
